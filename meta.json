@@ -1,8 +1,8 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "viam:speech-to-text",
-  "visibility": "public_unlisted",
-  "url": "",
+  "visibility": "public",
+  "url": "https://github.com/viam-labs/speech-to-text",
   "description": "Modular generic component: google-cloud-stt",
   "applications": null,
   "markdown_link": "README.md",

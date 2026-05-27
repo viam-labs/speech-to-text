@@ -6,20 +6,20 @@
 //
 // Wire shape (inverted callback):
 //
-//	1. Module starts. Spawns a background listener on the audio_in source.
-//	2. When audio_in emits audio chunks (e.g. filter-mic detected its wake
-//	   word), module opens a Google streaming session and forwards chunks.
-//	3. When Google returns a final transcript, module calls
-//	   transcript_target.DoCommand({
-//	       "command": "deliverTranscript",
-//	       "transcript": "...",
-//	       "is_final": true,
-//	       "confidence": 0.92,
-//	       "session_id": "...",
-//	       "source": "google-cloud-stt",
-//	   })
-//	4. When audio_in emits its segment-end sentinel (empty AudioChunk),
-//	   module closes the Google session and goes back to waiting.
+//  1. Module starts. Spawns a background listener on the audio_in source.
+//  2. When audio_in emits audio chunks (e.g. filter-mic detected its wake
+//     word), module opens a Google streaming session and forwards chunks.
+//  3. When Google returns a final transcript, module calls
+//     transcript_target.DoCommand({
+//     "command": "deliverTranscript",
+//     "transcript": "...",
+//     "is_final": true,
+//     "confidence": 0.92,
+//     "session_id": "...",
+//     "source": "google-cloud-stt",
+//     })
+//  4. When audio_in emits its segment-end sentinel (empty AudioChunk),
+//     module closes the Google session and goes back to waiting.
 //
 // If transcript_target is unset (testing mode), the module just logs finals
 // to stdout instead of calling back. Useful for local validation.
@@ -44,6 +44,7 @@ import (
 	generic "go.viam.com/rdk/components/generic"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
+	genericservice "go.viam.com/rdk/services/generic"
 	"go.viam.com/rdk/spatialmath"
 )
 
@@ -132,8 +133,8 @@ type speechToTextGoogleCloudStt struct {
 	runnerDone chan struct{}
 
 	// Active Google session ID (just for diagnostic logs / session_id in callbacks).
-	mu                sync.Mutex
-	activeSessionID   string
+	mu              sync.Mutex
+	activeSessionID string
 }
 
 func newSpeechToTextGoogleCloudStt(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -178,10 +179,9 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 	if err != nil {
 		return nil, fmt.Errorf("mic %q not found: %w", conf.Mic, err)
 	}
-
 	var transcriptTarget resource.Resource
 	if conf.TranscriptTarget != "" {
-		tgt, err := generic.FromProvider(deps, conf.TranscriptTarget)
+		tgt, err := genericservice.FromProvider(deps, conf.TranscriptTarget)
 		if err != nil {
 			return nil, fmt.Errorf("transcript_target %q not found: %w", conf.TranscriptTarget, err)
 		}
@@ -241,9 +241,9 @@ func (s *speechToTextGoogleCloudStt) DoCommand(ctx context.Context, cmd map[stri
 		active := s.activeSessionID
 		s.mu.Unlock()
 		return map[string]interface{}{
-			"active_session_id":         active,
-			"transcript_target":         s.cfg.TranscriptTarget,
-			"log_only":                  s.transcriptTarget == nil,
+			"active_session_id": active,
+			"transcript_target": s.cfg.TranscriptTarget,
+			"log_only":          s.transcriptTarget == nil,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown command %q (supported: status)", command)
@@ -288,11 +288,11 @@ func (s *speechToTextGoogleCloudStt) runListener() {
 // audio segment.
 func (s *speechToTextGoogleCloudStt) drainAudio(audioChan <-chan *audioin.AudioChunk) {
 	var (
-		gStream      speechpb.Speech_StreamingRecognizeClient
-		gStreamCtx   context.Context
-		gCancel      context.CancelFunc
-		recvDone     chan struct{}
-		sessionID    string
+		gStream    speechpb.Speech_StreamingRecognizeClient
+		gStreamCtx context.Context
+		gCancel    context.CancelFunc
+		recvDone   chan struct{}
+		sessionID  string
 	)
 
 	closeGoogleSession := func(reason string) {

@@ -31,11 +31,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"time"
 
-	speech "cloud.google.com/go/speech/apiv1"
-	speechpb "cloud.google.com/go/speech/apiv1/speechpb"
+	speech "cloud.google.com/go/speech/apiv2"
+	speechpb "cloud.google.com/go/speech/apiv2/speechpb"
 	"github.com/google/uuid"
 	"google.golang.org/api/option"
 
@@ -81,8 +82,15 @@ type Config struct {
 	// LanguageCode for recognition. Defaults to "en-US".
 	LanguageCode string `json:"language_code,omitempty"`
 
-	// Model picks the recognition model (e.g. "latest_short" for commands).
+	// Model picks the recognition model. v2 supports "latest_short" (default,
+	// for commands), "latest_long", "chirp_2", etc.
 	Model string `json:"model,omitempty"`
+
+	// ProjectID is the GCP project used in the recognizer resource path
+	// (projects/<id>/locations/global/recognizers/_). If empty, falls back
+	// to the project_id field of the inline credentials, then to the
+	// GOOGLE_CLOUD_PROJECT env var.
+	ProjectID string `json:"project_id,omitempty"`
 
 	// SampleRateHertz of the input audio. Defaults to 16000.
 	SampleRateHertz int32 `json:"sample_rate_hertz,omitempty"`
@@ -150,6 +158,20 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 	}
 	if conf.MaxSessionSeconds == 0 {
 		conf.MaxSessionSeconds = 290
+	}
+
+	// Resolve ProjectID for the v2 recognizer path. Priority: explicit
+	// config → project_id from inline credentials → GOOGLE_CLOUD_PROJECT env.
+	if conf.ProjectID == "" {
+		if pid, ok := conf.GoogleCredentialsJSON["project_id"].(string); ok {
+			conf.ProjectID = pid
+		}
+	}
+	if conf.ProjectID == "" {
+		conf.ProjectID = os.Getenv("GOOGLE_CLOUD_PROJECT")
+	}
+	if conf.ProjectID == "" {
+		return nil, fmt.Errorf("project_id required (set explicitly, in credentials, or via GOOGLE_CLOUD_PROJECT)")
 	}
 
 	audioInResource, err := audioin.FromProvider(deps, conf.Mic)
@@ -322,16 +344,27 @@ func (s *speechToTextGoogleCloudStt) drainAudio(audioChan <-chan *audioin.AudioC
 					continue
 				}
 				configReq := &speechpb.StreamingRecognizeRequest{
+					Recognizer: fmt.Sprintf(
+						"projects/%s/locations/global/recognizers/_",
+						s.cfg.ProjectID,
+					),
 					StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 						StreamingConfig: &speechpb.StreamingRecognitionConfig{
 							Config: &speechpb.RecognitionConfig{
-								Encoding:        speechpb.RecognitionConfig_LINEAR16,
-								SampleRateHertz: s.cfg.SampleRateHertz,
-								LanguageCode:    s.cfg.LanguageCode,
-								Model:           s.cfg.Model,
+								DecodingConfig: &speechpb.RecognitionConfig_ExplicitDecodingConfig{
+									ExplicitDecodingConfig: &speechpb.ExplicitDecodingConfig{
+										Encoding:          speechpb.ExplicitDecodingConfig_LINEAR16,
+										SampleRateHertz:   s.cfg.SampleRateHertz,
+										AudioChannelCount: 1,
+									},
+								},
+								LanguageCodes: []string{s.cfg.LanguageCode},
+								Model:         s.cfg.Model,
 							},
-							// Finals only — consumer only needs final transcripts.
-							InterimResults: false,
+							StreamingFeatures: &speechpb.StreamingRecognitionFeatures{
+								// Finals only — consumer only needs final transcripts.
+								InterimResults: false,
+							},
 						},
 					},
 				}
@@ -356,8 +389,8 @@ func (s *speechToTextGoogleCloudStt) drainAudio(audioChan <-chan *audioin.AudioC
 			}
 
 			audioReq := &speechpb.StreamingRecognizeRequest{
-				StreamingRequest: &speechpb.StreamingRecognizeRequest_AudioContent{
-					AudioContent: chunk.AudioData,
+				StreamingRequest: &speechpb.StreamingRecognizeRequest_Audio{
+					Audio: chunk.AudioData,
 				},
 			}
 			if err := gStream.Send(audioReq); err != nil {

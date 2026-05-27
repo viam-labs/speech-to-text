@@ -1,0 +1,13 @@
+{
+  "module_name": "speech-to-text",
+  "visibility": "public_unlisted",
+  "namespace": "viam",
+  "language": "go",
+  "resource_type": "component",
+  "resource_subtype": "generic",
+  "model_name": "google-cloud-stt",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-05-27T15:09:22.492594Z",
+  "module_readme_link": "README.md"
+}

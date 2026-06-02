@@ -15,7 +15,6 @@
 //     "transcript": "...",
 //     "is_final": true,
 //     "confidence": 0.92,
-//     "session_id": "...",
 //     "source": "google-cloud-stt",
 //     })
 //  4. When audio_in emits its segment-end sentinel (empty AudioChunk),
@@ -31,13 +30,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"sync"
 	"time"
 
 	speech "cloud.google.com/go/speech/apiv2"
 	speechpb "cloud.google.com/go/speech/apiv2/speechpb"
-	"github.com/google/uuid"
 	"google.golang.org/api/option"
 
 	audioin "go.viam.com/rdk/components/audioin"
@@ -46,6 +42,7 @@ import (
 	"go.viam.com/rdk/resource"
 	genericservice "go.viam.com/rdk/services/generic"
 	"go.viam.com/rdk/spatialmath"
+	goutils "go.viam.com/utils"
 )
 
 var (
@@ -76,9 +73,8 @@ type Config struct {
 	// dispatched. Useful for local testing.
 	TranscriptTarget string `json:"transcript_target,omitempty"`
 
-	// GoogleCredentialsJSON is the inline GCP service-account JSON. If
-	// empty, falls back to Application Default Credentials.
-	GoogleCredentialsJSON map[string]interface{} `json:"google_credentials_json,omitempty"`
+	// GoogleCredentialsJSON is the inline GCP service-account JSON. Required.
+	GoogleCredentialsJSON map[string]interface{} `json:"google_credentials_json"`
 
 	// LanguageCode for recognition. Defaults to "en-US".
 	LanguageCode string `json:"language_code,omitempty"`
@@ -86,12 +82,6 @@ type Config struct {
 	// Model picks the recognition model. v2 supports "latest_short" (default,
 	// for commands), "latest_long", "chirp_2", etc.
 	Model string `json:"model,omitempty"`
-
-	// ProjectID is the GCP project used in the recognizer resource path
-	// (projects/<id>/locations/global/recognizers/_). If empty, falls back
-	// to the project_id field of the inline credentials, then to the
-	// GOOGLE_CLOUD_PROJECT env var.
-	ProjectID string `json:"project_id,omitempty"`
 
 	// SampleRateHertz of the input audio. Defaults to 16000.
 	SampleRateHertz int32 `json:"sample_rate_hertz,omitempty"`
@@ -105,6 +95,9 @@ type Config struct {
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.Mic == "" {
 		return nil, nil, fmt.Errorf("%s: mic is required", path)
+	}
+	if len(cfg.GoogleCredentialsJSON) == 0 {
+		return nil, nil, fmt.Errorf("%s: google_credentials_json is required", path)
 	}
 	deps := []string{cfg.Mic}
 	if cfg.TranscriptTarget != "" {
@@ -122,19 +115,12 @@ type speechToTextGoogleCloudStt struct {
 	logger logging.Logger
 	cfg    *Config
 
-	cancelCtx  context.Context
-	cancelFunc func()
-
 	audioIn          audioin.AudioIn
 	transcriptTarget resource.Resource // generic resource, may be nil in log-only mode
 	speechClient     *speech.Client
+	projectID        string
 
-	// runnerDone closes when the background listener exits, so Close() can wait.
-	runnerDone chan struct{}
-
-	// Active Google session ID (just for diagnostic logs / session_id in callbacks).
-	mu              sync.Mutex
-	activeSessionID string
+	workers *goutils.StoppableWorkers
 }
 
 func newSpeechToTextGoogleCloudStt(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -161,18 +147,9 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 		conf.MaxSessionSeconds = 290
 	}
 
-	// Resolve ProjectID for the v2 recognizer path. Priority: explicit
-	// config → project_id from inline credentials → GOOGLE_CLOUD_PROJECT env.
-	if conf.ProjectID == "" {
-		if pid, ok := conf.GoogleCredentialsJSON["project_id"].(string); ok {
-			conf.ProjectID = pid
-		}
-	}
-	if conf.ProjectID == "" {
-		conf.ProjectID = os.Getenv("GOOGLE_CLOUD_PROJECT")
-	}
-	if conf.ProjectID == "" {
-		return nil, fmt.Errorf("project_id required (set explicitly, in credentials, or via GOOGLE_CLOUD_PROJECT)")
+	projectID, _ := conf.GoogleCredentialsJSON["project_id"].(string)
+	if projectID == "" {
+		return nil, fmt.Errorf("google_credentials_json missing project_id field")
 	}
 
 	audioInResource, err := audioin.FromProvider(deps, conf.Mic)
@@ -201,19 +178,16 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 		return nil, fmt.Errorf("create google speech client: %w", err)
 	}
 
-	cancelCtx, cancelFunc := context.WithCancel(context.Background())
-
 	s := &speechToTextGoogleCloudStt{
 		name:             name,
 		logger:           logger,
 		cfg:              conf,
-		cancelCtx:        cancelCtx,
-		cancelFunc:       cancelFunc,
 		audioIn:          audioInResource,
 		transcriptTarget: transcriptTarget,
 		speechClient:     speechClient,
-		runnerDone:       make(chan struct{}),
+		projectID:        projectID,
 	}
+	s.workers = goutils.NewBackgroundStoppableWorkers(s.runListener)
 
 	mode := "log-only"
 	if transcriptTarget != nil {
@@ -222,7 +196,6 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 	logger.Infof("speech-to-text module ready: mic=%s lang=%s model=%s mode=%s",
 		conf.Mic, conf.LanguageCode, conf.Model, mode)
 
-	go s.runListener()
 	return s, nil
 }
 
@@ -237,11 +210,7 @@ func (s *speechToTextGoogleCloudStt) DoCommand(ctx context.Context, cmd map[stri
 	command, _ := cmd["command"].(string)
 	switch command {
 	case "status":
-		s.mu.Lock()
-		active := s.activeSessionID
-		s.mu.Unlock()
 		return map[string]interface{}{
-			"active_session_id": active,
 			"transcript_target": s.cfg.TranscriptTarget,
 			"log_only":          s.transcriptTarget == nil,
 		}, nil
@@ -254,22 +223,20 @@ func (s *speechToTextGoogleCloudStt) DoCommand(ctx context.Context, cmd map[stri
 // When chunks start arriving (wake fired upstream), it opens a Google session
 // and forwards them. When the empty-chunk sentinel arrives, it closes the
 // session and loops back to waiting. Runs for the lifetime of the module.
-func (s *speechToTextGoogleCloudStt) runListener() {
-	defer close(s.runnerDone)
-
+func (s *speechToTextGoogleCloudStt) runListener(ctx context.Context) {
 	for {
-		if s.cancelCtx.Err() != nil {
+		if ctx.Err() != nil {
 			return
 		}
 
-		audioChan, err := s.audioIn.GetAudio(s.cancelCtx, "pcm16", 0, 0, nil)
+		audioChan, err := s.audioIn.GetAudio(ctx, "pcm16", 0, 0, nil)
 		if err != nil {
-			if s.cancelCtx.Err() != nil {
+			if ctx.Err() != nil {
 				return
 			}
 			s.logger.Warnf("audio_in.GetAudio: %v; retrying in 1s", err)
 			select {
-			case <-s.cancelCtx.Done():
+			case <-ctx.Done():
 				return
 			case <-time.After(time.Second):
 			}
@@ -279,20 +246,19 @@ func (s *speechToTextGoogleCloudStt) runListener() {
 		// Drain chunks. Open a Google session lazily when first non-empty
 		// chunk arrives. Close it on segment-end (empty chunk) or channel
 		// close.
-		s.drainAudio(audioChan)
+		s.drainAudio(ctx, audioChan)
 	}
 }
 
 // drainAudio reads chunks from a single audio_in channel until it closes or
 // the module shuts down. Manages the lifecycle of one Google session per
 // audio segment.
-func (s *speechToTextGoogleCloudStt) drainAudio(audioChan <-chan *audioin.AudioChunk) {
+func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <-chan *audioin.AudioChunk) {
 	var (
 		gStream    speechpb.Speech_StreamingRecognizeClient
 		gStreamCtx context.Context
 		gCancel    context.CancelFunc
 		recvDone   chan struct{}
-		sessionID  string
 	)
 
 	closeGoogleSession := func(reason string) {
@@ -302,23 +268,17 @@ func (s *speechToTextGoogleCloudStt) drainAudio(audioChan <-chan *audioin.AudioC
 		_ = gStream.CloseSend()
 		<-recvDone
 		gCancel()
-		s.logger.Infof("session %s closed (%s)", sessionID, reason)
-		s.mu.Lock()
-		if s.activeSessionID == sessionID {
-			s.activeSessionID = ""
-		}
-		s.mu.Unlock()
+		s.logger.Infof("session closed (%s)", reason)
 		gStream = nil
 		gStreamCtx = nil
 		gCancel = nil
 		recvDone = nil
-		sessionID = ""
 	}
 	defer closeGoogleSession("audio_in channel closed")
 
 	for {
 		select {
-		case <-s.cancelCtx.Done():
+		case <-ctx.Done():
 			return
 		case chunk, ok := <-audioChan:
 			if !ok {
@@ -331,22 +291,20 @@ func (s *speechToTextGoogleCloudStt) drainAudio(audioChan <-chan *audioin.AudioC
 			}
 			if gStream == nil {
 				// Lazily open a Google session on first non-empty chunk.
-				sessionID = uuid.NewString()
-				gStreamCtx, gCancel = context.WithTimeout(s.cancelCtx, time.Duration(s.cfg.MaxSessionSeconds)*time.Second)
+				gStreamCtx, gCancel = context.WithTimeout(ctx, time.Duration(s.cfg.MaxSessionSeconds)*time.Second)
 				st, err := s.speechClient.StreamingRecognize(gStreamCtx)
 				if err != nil {
-					s.logger.Warnf("session %s: open google stream: %v", sessionID, err)
+					s.logger.Warnf("open google stream: %v", err)
 					gCancel()
 					gStream = nil
 					gStreamCtx = nil
 					gCancel = nil
-					sessionID = ""
 					continue
 				}
 				configReq := &speechpb.StreamingRecognizeRequest{
 					Recognizer: fmt.Sprintf(
 						"projects/%s/locations/global/recognizers/_",
-						s.cfg.ProjectID,
+						s.projectID,
 					),
 					StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 						StreamingConfig: &speechpb.StreamingRecognitionConfig{
@@ -369,23 +327,17 @@ func (s *speechToTextGoogleCloudStt) drainAudio(audioChan <-chan *audioin.AudioC
 					},
 				}
 				if err := st.Send(configReq); err != nil {
-					s.logger.Warnf("session %s: send config: %v", sessionID, err)
+					s.logger.Warnf("send config: %v", err)
 					gCancel()
 					gStream = nil
 					gStreamCtx = nil
 					gCancel = nil
-					sessionID = ""
 					continue
 				}
 				gStream = st
 				recvDone = make(chan struct{})
-				capturedID := sessionID
-				capturedStream := st
-				go s.receiveFromGoogle(capturedStream, capturedID, recvDone)
-				s.mu.Lock()
-				s.activeSessionID = sessionID
-				s.mu.Unlock()
-				s.logger.Infof("session %s opened (first audio chunk)", sessionID)
+				go s.receiveFromGoogle(ctx, st, recvDone)
+				s.logger.Infof("session opened (first audio chunk)")
 			}
 
 			audioReq := &speechpb.StreamingRecognizeRequest{
@@ -394,7 +346,7 @@ func (s *speechToTextGoogleCloudStt) drainAudio(audioChan <-chan *audioin.AudioC
 				},
 			}
 			if err := gStream.Send(audioReq); err != nil {
-				s.logger.Warnf("session %s: send audio: %v", sessionID, err)
+				s.logger.Warnf("send audio: %v", err)
 				closeGoogleSession("send error")
 			}
 		}
@@ -403,7 +355,7 @@ func (s *speechToTextGoogleCloudStt) drainAudio(audioChan <-chan *audioin.AudioC
 
 // receiveFromGoogle drains Google's response stream. For every final
 // transcript, dispatches to the configured transcript_target (or logs).
-func (s *speechToTextGoogleCloudStt) receiveFromGoogle(gStream speechpb.Speech_StreamingRecognizeClient, sessionID string, done chan struct{}) {
+func (s *speechToTextGoogleCloudStt) receiveFromGoogle(ctx context.Context, gStream speechpb.Speech_StreamingRecognizeClient, done chan struct{}) {
 	defer close(done)
 	for {
 		resp, err := gStream.Recv()
@@ -411,8 +363,8 @@ func (s *speechToTextGoogleCloudStt) receiveFromGoogle(gStream speechpb.Speech_S
 			return
 		}
 		if err != nil {
-			if s.cancelCtx.Err() == nil {
-				s.logger.Warnf("session %s: google recv: %v", sessionID, err)
+			if ctx.Err() == nil {
+				s.logger.Warnf("google recv: %v", err)
 			}
 			return
 		}
@@ -422,31 +374,30 @@ func (s *speechToTextGoogleCloudStt) receiveFromGoogle(gStream speechpb.Speech_S
 			}
 			text := result.Alternatives[0].Transcript
 			conf := result.Alternatives[0].Confidence
-			s.deliverFinal(sessionID, text, conf)
+			s.deliverFinal(ctx, text, conf)
 		}
 	}
 }
 
 // deliverFinal dispatches one final transcript. If transcript_target is
 // configured, calls its DoCommand. Otherwise just logs.
-func (s *speechToTextGoogleCloudStt) deliverFinal(sessionID, text string, confidence float32) {
-	s.logger.Infof("session %s FINAL: %q (conf=%.2f)", sessionID, text, confidence)
+func (s *speechToTextGoogleCloudStt) deliverFinal(ctx context.Context, text string, confidence float32) {
+	s.logger.Debugf("FINAL: %q (conf=%.2f)", text, confidence)
 	if s.transcriptTarget == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
+	doCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	_, err := s.transcriptTarget.DoCommand(ctx, map[string]interface{}{
+	_, err := s.transcriptTarget.DoCommand(doCtx, map[string]interface{}{
 		"command":    "deliverTranscript",
 		"transcript": text,
 		"is_final":   true,
 		"confidence": float64(confidence),
-		"session_id": sessionID,
 		"source":     "google-cloud-stt",
 	})
 	if err != nil {
-		s.logger.Warnf("session %s: deliverTranscript to %s: %v",
-			sessionID, s.cfg.TranscriptTarget, err)
+		s.logger.Warnf("deliverTranscript to %s: %v",
+			s.cfg.TranscriptTarget, err)
 	}
 }
 
@@ -455,8 +406,7 @@ func (s *speechToTextGoogleCloudStt) Geometries(ctx context.Context, extra map[s
 }
 
 func (s *speechToTextGoogleCloudStt) Close(_ context.Context) error {
-	s.cancelFunc()
-	<-s.runnerDone
+	s.workers.Stop()
 	if s.speechClient != nil {
 		return s.speechClient.Close()
 	}

@@ -83,6 +83,12 @@ type Config struct {
 	// for commands), "latest_long", "chirp_2", etc.
 	Model string `json:"model,omitempty"`
 
+	// Location is the Google Cloud region for the Speech v2 recognizer.
+	// Defaults to "global". Models like "chirp_2" are only available in
+	// regional endpoints (e.g. "us-central1", "us-east1", "europe-west4").
+	// When set to a non-global region, the client targets <location>-speech.googleapis.com.
+	Location string `json:"location,omitempty"`
+
 	// SampleRateHertz of the input audio. Defaults to 16000.
 	SampleRateHertz int32 `json:"sample_rate_hertz,omitempty"`
 
@@ -119,6 +125,7 @@ type speechToTextGoogleCloudStt struct {
 	transcriptTarget resource.Resource // generic resource, may be nil in log-only mode
 	speechClient     *speech.Client
 	projectID        string
+	location         string
 
 	workers *goutils.StoppableWorkers
 }
@@ -165,6 +172,10 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 		transcriptTarget = tgt
 	}
 
+	location := conf.Location
+	if location == "" {
+		location = "global"
+	}
 	var clientOpts []option.ClientOption
 	if len(conf.GoogleCredentialsJSON) > 0 {
 		credBytes, err := json.Marshal(conf.GoogleCredentialsJSON)
@@ -172,6 +183,9 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 			return nil, fmt.Errorf("marshal google_credentials_json: %w", err)
 		}
 		clientOpts = append(clientOpts, option.WithCredentialsJSON(credBytes))
+	}
+	if location != "global" {
+		clientOpts = append(clientOpts, option.WithEndpoint(fmt.Sprintf("%s-speech.googleapis.com:443", location)))
 	}
 	speechClient, err := speech.NewClient(ctx, clientOpts...)
 	if err != nil {
@@ -186,6 +200,7 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 		transcriptTarget: transcriptTarget,
 		speechClient:     speechClient,
 		projectID:        projectID,
+		location:         location,
 	}
 	s.workers = goutils.NewBackgroundStoppableWorkers(s.runListener)
 
@@ -259,6 +274,7 @@ func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <
 		gStreamCtx context.Context
 		gCancel    context.CancelFunc
 		recvDone   chan struct{}
+		audioSent  int
 	)
 
 	closeGoogleSession := func(reason string) {
@@ -268,11 +284,12 @@ func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <
 		_ = gStream.CloseSend()
 		<-recvDone
 		gCancel()
-		s.logger.Infof("session closed (%s)", reason)
+		s.logger.Infof("session closed (%s) audio_sent=%d bytes", reason, audioSent)
 		gStream = nil
 		gStreamCtx = nil
 		gCancel = nil
 		recvDone = nil
+		audioSent = 0
 	}
 	defer closeGoogleSession("audio_in channel closed")
 
@@ -303,8 +320,9 @@ func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <
 				}
 				configReq := &speechpb.StreamingRecognizeRequest{
 					Recognizer: fmt.Sprintf(
-						"projects/%s/locations/global/recognizers/_",
+						"projects/%s/locations/%s/recognizers/_",
 						s.projectID,
+						s.location,
 					),
 					StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 						StreamingConfig: &speechpb.StreamingRecognitionConfig{
@@ -348,6 +366,8 @@ func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <
 			if err := gStream.Send(audioReq); err != nil {
 				s.logger.Warnf("send audio: %v", err)
 				closeGoogleSession("send error")
+			} else {
+				audioSent += len(chunk.AudioData)
 			}
 		}
 	}
@@ -357,6 +377,10 @@ func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <
 // transcript, dispatches to the configured transcript_target (or logs).
 func (s *speechToTextGoogleCloudStt) receiveFromGoogle(ctx context.Context, gStream speechpb.Speech_StreamingRecognizeClient, done chan struct{}) {
 	defer close(done)
+	respCount, finalCount, interimCount := 0, 0, 0
+	defer func() {
+		s.logger.Infof("google recv done: responses=%d finals=%d interims=%d", respCount, finalCount, interimCount)
+	}()
 	for {
 		resp, err := gStream.Recv()
 		if err == io.EOF {
@@ -368,12 +392,19 @@ func (s *speechToTextGoogleCloudStt) receiveFromGoogle(ctx context.Context, gStr
 			}
 			return
 		}
+		respCount++
 		for _, result := range resp.Results {
-			if !result.IsFinal || len(result.Alternatives) == 0 {
+			if len(result.Alternatives) == 0 {
 				continue
 			}
+			if !result.IsFinal {
+				interimCount++
+				continue
+			}
+			finalCount++
 			text := result.Alternatives[0].Transcript
 			conf := result.Alternatives[0].Confidence
+			s.logger.Infof("FINAL: %q (conf=%.2f)", text, conf)
 			s.deliverFinal(ctx, text, conf)
 		}
 	}

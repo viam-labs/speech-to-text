@@ -25,35 +25,42 @@
 package speechtotext
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	speech "cloud.google.com/go/speech/apiv2"
 	speechpb "cloud.google.com/go/speech/apiv2/speechpb"
+	"github.com/google/uuid"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	audioin "go.viam.com/rdk/components/audioin"
 	generic "go.viam.com/rdk/components/generic"
+	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	genericservice "go.viam.com/rdk/services/generic"
 	"go.viam.com/rdk/spatialmath"
+	rutils "go.viam.com/rdk/utils"
 	goutils "go.viam.com/utils"
 )
 
 var (
-	GoogleCloudStt   = resource.NewModel("viam", "speech-to-text", "google-cloud-stt")
+	GoogleCloudSTT   = resource.NewModel("viam", "speech-to-text", "google-cloud-stt")
 	errUnimplemented = errors.New("unimplemented")
 )
 
 func init() {
-	resource.RegisterComponent(generic.API, GoogleCloudStt,
+	resource.RegisterComponent(generic.API, GoogleCloudSTT,
 		resource.Registration[resource.Resource, *Config]{
-			Constructor: newSpeechToTextGoogleCloudStt,
+			Constructor: newGoogleCloudSTT,
 		},
 	)
 }
@@ -95,6 +102,11 @@ type Config struct {
 	// MaxSessionSeconds caps a single Google streaming session. Google's
 	// hard cap is 305s; defaults to 290s.
 	MaxSessionSeconds int `json:"max_session_seconds,omitempty"`
+
+	// SessionSensorName is the Viam resource name of a session-sensor
+	// component that captures per-session WAV + metadata for the Data tab.
+	// Optional — if empty, capture is disabled and the module runs as before.
+	SessionSensorName string `json:"session_sensor_name,omitempty"`
 }
 
 // Validate declares dependencies and validates required fields.
@@ -102,17 +114,20 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.Mic == "" {
 		return nil, nil, fmt.Errorf("%s: mic is required", path)
 	}
+	deps := []string{cfg.Mic}
 	if len(cfg.GoogleCredentialsJSON) == 0 {
 		return nil, nil, fmt.Errorf("%s: google_credentials_json is required", path)
 	}
-	deps := []string{cfg.Mic}
 	if cfg.TranscriptTarget != "" {
 		deps = append(deps, cfg.TranscriptTarget)
+	}
+	if cfg.SessionSensorName != "" {
+		deps = append(deps, cfg.SessionSensorName)
 	}
 	return deps, nil, nil
 }
 
-type speechToTextGoogleCloudStt struct {
+type googleCloudSTT struct {
 	resource.AlwaysRebuild
 	resource.Named
 
@@ -123,24 +138,23 @@ type speechToTextGoogleCloudStt struct {
 
 	audioIn          audioin.AudioIn
 	transcriptTarget resource.Resource // generic resource, may be nil in log-only mode
+	sessionSink      SessionSensorSink // nil if session_sensor_name unset
 	speechClient     *speech.Client
 	projectID        string
-	location         string
 
 	workers *goutils.StoppableWorkers
 }
 
-func newSpeechToTextGoogleCloudStt(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
+func newGoogleCloudSTT(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
 	conf, err := resource.NativeConfig[*Config](rawConf)
 	if err != nil {
 		return nil, err
 	}
-	return NewGoogleCloudStt(ctx, deps, rawConf.ResourceName(), conf, logger)
+	return NewGoogleCloudSTT(ctx, deps, rawConf.ResourceName(), conf, logger)
 }
 
-// NewGoogleCloudStt is the typed constructor. Resolves deps, builds the Google
 // client, and spawns the background listener.
-func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (resource.Resource, error) {
+func NewGoogleCloudSTT(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (resource.Resource, error) {
 	if conf.LanguageCode == "" {
 		conf.LanguageCode = "en-US"
 	}
@@ -152,6 +166,9 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 	}
 	if conf.MaxSessionSeconds == 0 {
 		conf.MaxSessionSeconds = 290
+	}
+	if conf.Location == "" {
+		conf.Location = "global"
 	}
 
 	projectID, _ := conf.GoogleCredentialsJSON["project_id"].(string)
@@ -172,10 +189,19 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 		transcriptTarget = tgt
 	}
 
-	location := conf.Location
-	if location == "" {
-		location = "global"
+	var sessionSink SessionSensorSink
+	if conf.SessionSensorName != "" {
+		sensorRes, err := sensor.FromDependencies(deps, conf.SessionSensorName)
+		if err != nil {
+			return nil, fmt.Errorf("session_sensor_name %q not found: %w", conf.SessionSensorName, err)
+		}
+		sink, ok := sensorRes.(SessionSensorSink)
+		if !ok {
+			return nil, fmt.Errorf("session_sensor_name %q does not implement SessionSensorSink (got %T) — must be a viam:speech-to-text:session-sensor", conf.SessionSensorName, sensorRes)
+		}
+		sessionSink = sink
 	}
+
 	var clientOpts []option.ClientOption
 	if len(conf.GoogleCredentialsJSON) > 0 {
 		credBytes, err := json.Marshal(conf.GoogleCredentialsJSON)
@@ -184,23 +210,32 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 		}
 		clientOpts = append(clientOpts, option.WithCredentialsJSON(credBytes))
 	}
-	if location != "global" {
-		clientOpts = append(clientOpts, option.WithEndpoint(fmt.Sprintf("%s-speech.googleapis.com:443", location)))
+	if conf.Location != "global" {
+		clientOpts = append(clientOpts, option.WithEndpoint(fmt.Sprintf("%s-speech.googleapis.com:443", conf.Location)))
 	}
 	speechClient, err := speech.NewClient(ctx, clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create google speech client: %w", err)
 	}
 
-	s := &speechToTextGoogleCloudStt{
+	// Probe the configured model/language/location against Google up-front so a
+	// bad combination fails the constructor instead of looping on every wake
+	// word at runtime (e.g. "language en-US not supported by model long in
+	// northamerica-northeast1").
+	if err := probeGoogleConfig(ctx, speechClient, conf, projectID); err != nil {
+		_ = speechClient.Close()
+		return nil, err
+	}
+
+	s := &googleCloudSTT{
 		name:             name,
 		logger:           logger,
 		cfg:              conf,
 		audioIn:          audioInResource,
 		transcriptTarget: transcriptTarget,
+		sessionSink:      sessionSink,
 		speechClient:     speechClient,
 		projectID:        projectID,
-		location:         location,
 	}
 	s.workers = goutils.NewBackgroundStoppableWorkers(s.runListener)
 
@@ -208,20 +243,24 @@ func NewGoogleCloudStt(ctx context.Context, deps resource.Dependencies, name res
 	if transcriptTarget != nil {
 		mode = "callback → " + conf.TranscriptTarget
 	}
-	logger.Infof("speech-to-text module ready: mic=%s lang=%s model=%s mode=%s",
-		conf.Mic, conf.LanguageCode, conf.Model, mode)
+	sinkMode := "disabled"
+	if sessionSink != nil {
+		sinkMode = "→ " + conf.SessionSensorName
+	}
+	logger.Infof("speech-to-text module ready: mic=%s lang=%s model=%s mode=%s session_sensor=%s",
+		conf.Mic, conf.LanguageCode, conf.Model, mode, sinkMode)
 
 	return s, nil
 }
 
-func (s *speechToTextGoogleCloudStt) Name() resource.Name {
+func (s *googleCloudSTT) Name() resource.Name {
 	return s.name
 }
 
 // DoCommand exposes a minimal status interface for debugging. The module's
 // real output flows to the configured transcript_target — there's no need for
 // consumers to poll this module.
-func (s *speechToTextGoogleCloudStt) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+func (s *googleCloudSTT) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	command, _ := cmd["command"].(string)
 	switch command {
 	case "status":
@@ -238,7 +277,7 @@ func (s *speechToTextGoogleCloudStt) DoCommand(ctx context.Context, cmd map[stri
 // When chunks start arriving (wake fired upstream), it opens a Google session
 // and forwards them. When the empty-chunk sentinel arrives, it closes the
 // session and loops back to waiting. Runs for the lifetime of the module.
-func (s *speechToTextGoogleCloudStt) runListener(ctx context.Context) {
+func (s *googleCloudSTT) runListener(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -265,16 +304,103 @@ func (s *speechToTextGoogleCloudStt) runListener(ctx context.Context) {
 	}
 }
 
+// probeGoogleConfig opens a short streaming session with the configured
+// model/language/location and sends a tiny silent chunk to force server-side
+// validation. Returns an error if Google rejects the config with a code that
+// will never succeed (InvalidArgument, Unauthenticated, PermissionDenied,
+// NotFound). Other errors (network, transient) are logged but allowed through
+// — the runtime loop handles retries.
+func probeGoogleConfig(ctx context.Context, client *speech.Client, conf *Config, projectID string) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	st, err := client.StreamingRecognize(probeCtx)
+	if err != nil {
+		return fmt.Errorf("probe stream open: %w", err)
+	}
+
+	configReq := &speechpb.StreamingRecognizeRequest{
+		Recognizer: fmt.Sprintf("projects/%s/locations/%s/recognizers/_", projectID, conf.Location),
+		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
+			StreamingConfig: &speechpb.StreamingRecognitionConfig{
+				Config: &speechpb.RecognitionConfig{
+					DecodingConfig: &speechpb.RecognitionConfig_ExplicitDecodingConfig{
+						ExplicitDecodingConfig: &speechpb.ExplicitDecodingConfig{
+							Encoding:          speechpb.ExplicitDecodingConfig_LINEAR16,
+							SampleRateHertz:   conf.SampleRateHertz,
+							AudioChannelCount: 1,
+						},
+					},
+					LanguageCodes: []string{conf.LanguageCode},
+					Model:         conf.Model,
+				},
+			},
+		},
+	}
+	if err := st.Send(configReq); err != nil {
+		return fmt.Errorf("probe config send: %w", err)
+	}
+	// 10ms of silence at 16kHz mono PCM16 = 320 bytes.
+	silence := make([]byte, int(conf.SampleRateHertz)*2/100)
+	if err := st.Send(&speechpb.StreamingRecognizeRequest{
+		StreamingRequest: &speechpb.StreamingRecognizeRequest_Audio{Audio: silence},
+	}); err != nil {
+		return fmt.Errorf("probe audio send: %w", err)
+	}
+	_ = st.CloseSend()
+
+	for {
+		_, err := st.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err == nil {
+			continue
+		}
+		if s, ok := status.FromError(err); ok {
+			switch s.Code() {
+			case codes.InvalidArgument, codes.Unauthenticated, codes.PermissionDenied, codes.NotFound:
+				return fmt.Errorf("speech-to-text config rejected by Google (model=%q language=%q location=%q): %w",
+					conf.Model, conf.LanguageCode, conf.Location, err)
+			}
+		}
+		// Non-config error (network, deadline, etc.) — don't block startup.
+		return nil
+	}
+}
+
+// sessionState holds per-Google-session state shared between drainAudio (the
+// sender side) and receiveFromGoogle (the receiver side). The send-side fields
+// (captureID, startedAt, audioBuf, audioSent) are owned exclusively by
+// drainAudio and need no locking; the recv-side fields (latest transcript /
+// confidence + counters) are written by receiveFromGoogle and read by
+// drainAudio at session close, so they sit behind mu.
+type sessionState struct {
+	captureID string
+	startedAt time.Time
+	audioBuf  bytes.Buffer
+	audioSent int
+	recvErr   error // last non-EOF error from gStream.Recv, if any
+	sendErr   error // last error from gStream.Send, if any
+
+	mu               sync.Mutex
+	latestTranscript string
+	latestConfidence float64
+	respCount        int
+	finalCount       int
+	interimCount     int
+}
+
 // drainAudio reads chunks from a single audio_in channel until it closes or
 // the module shuts down. Manages the lifecycle of one Google session per
 // audio segment.
-func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <-chan *audioin.AudioChunk) {
+func (s *googleCloudSTT) drainAudio(ctx context.Context, audioChan <-chan *audioin.AudioChunk) {
 	var (
 		gStream    speechpb.Speech_StreamingRecognizeClient
 		gStreamCtx context.Context
 		gCancel    context.CancelFunc
 		recvDone   chan struct{}
-		audioSent  int
+		sess       *sessionState
 	)
 
 	closeGoogleSession := func(reason string) {
@@ -284,12 +410,32 @@ func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <
 		_ = gStream.CloseSend()
 		<-recvDone
 		gCancel()
-		s.logger.Infof("session closed (%s) audio_sent=%d bytes", reason, audioSent)
+		// Normalize: a segment-end sentinel without any finals is a no-result.
+		// A recv error trumps the original reason.
+		normalized := reason
+		sess.mu.Lock()
+		finals := sess.finalCount
+		recvErr := sess.recvErr
+		sess.mu.Unlock()
+		switch {
+		case recvErr != nil:
+			normalized = "recv_error"
+		case reason == "segment-end sentinel" && finals > 0:
+			normalized = "success"
+		case reason == "segment-end sentinel" && finals == 0:
+			normalized = "no_result"
+		case reason == "audio_in channel closed":
+			normalized = "context_cancelled"
+		case reason == "send error":
+			normalized = "send_error"
+		}
+		s.logger.Infof("session closed (%s) audio_sent=%d bytes", normalized, sess.audioSent)
+		s.pushSessionCapture(ctx, sess, normalized)
 		gStream = nil
 		gStreamCtx = nil
 		gCancel = nil
 		recvDone = nil
-		audioSent = 0
+		sess = nil
 	}
 	defer closeGoogleSession("audio_in channel closed")
 
@@ -322,7 +468,7 @@ func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <
 					Recognizer: fmt.Sprintf(
 						"projects/%s/locations/%s/recognizers/_",
 						s.projectID,
-						s.location,
+						s.cfg.Location,
 					),
 					StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 						StreamingConfig: &speechpb.StreamingRecognitionConfig{
@@ -354,8 +500,12 @@ func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <
 				}
 				gStream = st
 				recvDone = make(chan struct{})
-				go s.receiveFromGoogle(ctx, st, recvDone)
-				s.logger.Infof("session opened (first audio chunk)")
+				sess = &sessionState{
+					captureID: uuid.NewString(),
+					startedAt: time.Now(),
+				}
+				go s.receiveFromGoogle(ctx, st, sess, recvDone)
+				s.logger.Infof("session opened (first audio chunk) capture_id=%s", sess.captureID)
 			}
 
 			audioReq := &speechpb.StreamingRecognizeRequest{
@@ -365,9 +515,11 @@ func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <
 			}
 			if err := gStream.Send(audioReq); err != nil {
 				s.logger.Warnf("send audio: %v", err)
+				sess.sendErr = err
 				closeGoogleSession("send error")
 			} else {
-				audioSent += len(chunk.AudioData)
+				sess.audioSent += len(chunk.AudioData)
+				sess.audioBuf.Write(chunk.AudioData)
 			}
 		}
 	}
@@ -375,11 +527,14 @@ func (s *speechToTextGoogleCloudStt) drainAudio(ctx context.Context, audioChan <
 
 // receiveFromGoogle drains Google's response stream. For every final
 // transcript, dispatches to the configured transcript_target (or logs).
-func (s *speechToTextGoogleCloudStt) receiveFromGoogle(ctx context.Context, gStream speechpb.Speech_StreamingRecognizeClient, done chan struct{}) {
+// Counters and the latest transcript/confidence are recorded on sess so the
+// sender side can include them in the session-sensor push at close time.
+func (s *googleCloudSTT) receiveFromGoogle(ctx context.Context, gStream speechpb.Speech_StreamingRecognizeClient, sess *sessionState, done chan struct{}) {
 	defer close(done)
-	respCount, finalCount, interimCount := 0, 0, 0
 	defer func() {
-		s.logger.Infof("google recv done: responses=%d finals=%d interims=%d", respCount, finalCount, interimCount)
+		sess.mu.Lock()
+		s.logger.Infof("google recv done: responses=%d finals=%d interims=%d", sess.respCount, sess.finalCount, sess.interimCount)
+		sess.mu.Unlock()
 	}()
 	for {
 		resp, err := gStream.Recv()
@@ -389,30 +544,108 @@ func (s *speechToTextGoogleCloudStt) receiveFromGoogle(ctx context.Context, gStr
 		if err != nil {
 			if ctx.Err() == nil {
 				s.logger.Warnf("google recv: %v", err)
+				sess.recvErr = err
 			}
 			return
 		}
-		respCount++
+		sess.mu.Lock()
+		sess.respCount++
+		sess.mu.Unlock()
 		for _, result := range resp.Results {
 			if len(result.Alternatives) == 0 {
 				continue
 			}
 			if !result.IsFinal {
-				interimCount++
+				sess.mu.Lock()
+				sess.interimCount++
+				sess.mu.Unlock()
 				continue
 			}
-			finalCount++
 			text := result.Alternatives[0].Transcript
 			conf := result.Alternatives[0].Confidence
-			s.logger.Infof("FINAL: %q (conf=%.2f)", text, conf)
+			sess.mu.Lock()
+			sess.finalCount++
+			sess.latestTranscript = text
+			sess.latestConfidence = float64(conf)
+			sess.mu.Unlock()
 			s.deliverFinal(ctx, text, conf)
 		}
 	}
 }
 
+// pushSessionCapture snapshots the session state and forwards it to the
+// configured session-sensor sink. Runs in a goroutine so a slow upload never
+// blocks the audio loop. No-op if no sink is configured.
+func (s *googleCloudSTT) pushSessionCapture(ctx context.Context, sess *sessionState, closeReason string) {
+	if s.sessionSink == nil {
+		s.logger.Debugf("session-sensor not configured — skipping push for close_reason=%s", closeReason)
+		return
+	}
+	if sess == nil || sess.captureID == "" {
+		return
+	}
+	sess.mu.Lock()
+	transcript := sess.latestTranscript
+	confidence := sess.latestConfidence
+	respCount := sess.respCount
+	finalCount := sess.finalCount
+	interimCount := sess.interimCount
+	sess.mu.Unlock()
+
+	// Surface the underlying gRPC error for recv_error / send_error close
+	// paths so debugging doesn't require SSH'ing to the module logs.
+	errorMessage := ""
+	switch closeReason {
+	case "recv_error":
+		if sess.recvErr != nil {
+			errorMessage = sess.recvErr.Error()
+		}
+	case "send_error":
+		if sess.sendErr != nil {
+			errorMessage = sess.sendErr.Error()
+		}
+	}
+
+	wav, err := audioin.CreateWAVFile(sess.audioBuf.Bytes(), s.cfg.SampleRateHertz, 1, rutils.CodecPCM16)
+	if err != nil {
+		s.logger.Warnf("session-sensor: wrap PCM as WAV (capture_id=%s): %v", sess.captureID, err)
+		wav = nil
+	}
+	r := SessionReading{
+		CaptureID:      sess.captureID,
+		Transcript:     transcript,
+		Confidence:     confidence,
+		CloseReason:    closeReason,
+		ErrorMessage:   errorMessage,
+		AudioSentBytes: sess.audioSent,
+		WAV:            wav,
+		StartTime:      sess.startedAt,
+		EndTime:        time.Now(),
+		LanguageCode:   s.cfg.LanguageCode,
+		Model:          s.cfg.Model,
+		ResponseCount:  respCount,
+		FinalCount:     finalCount,
+		InterimCount:   interimCount,
+	}
+	sink := s.sessionSink
+	logger := s.logger
+	go func() {
+		// Detach from caller's ctx — the audio loop may be tearing down.
+		pushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		binID, err := sink.PushSession(pushCtx, r)
+		if err != nil {
+			logger.Warnf("session-sensor push (capture_id=%s): %v", r.CaptureID, err)
+			return
+		}
+		logger.Debugf("session-sensor push ok: capture_id=%s binary_data_id=%q close_reason=%s wav_bytes=%d", r.CaptureID, binID, r.CloseReason, len(r.WAV))
+	}()
+	_ = ctx // ctx intentionally unused — capture should survive the close path
+}
+
 // deliverFinal dispatches one final transcript. If transcript_target is
 // configured, calls its DoCommand. Otherwise just logs.
-func (s *speechToTextGoogleCloudStt) deliverFinal(ctx context.Context, text string, confidence float32) {
+func (s *googleCloudSTT) deliverFinal(ctx context.Context, text string, confidence float32) {
 	s.logger.Debugf("FINAL: %q (conf=%.2f)", text, confidence)
 	if s.transcriptTarget == nil {
 		return
@@ -432,11 +665,11 @@ func (s *speechToTextGoogleCloudStt) deliverFinal(ctx context.Context, text stri
 	}
 }
 
-func (s *speechToTextGoogleCloudStt) Geometries(ctx context.Context, extra map[string]interface{}) ([]spatialmath.Geometry, error) {
+func (s *googleCloudSTT) Geometries(ctx context.Context, extra map[string]interface{}) ([]spatialmath.Geometry, error) {
 	return nil, errUnimplemented
 }
 
-func (s *speechToTextGoogleCloudStt) Close(_ context.Context) error {
+func (s *googleCloudSTT) Close(_ context.Context) error {
 	s.workers.Stop()
 	if s.speechClient != nil {
 		return s.speechClient.Close()

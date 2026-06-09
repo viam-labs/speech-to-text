@@ -391,53 +391,26 @@ type sessionState struct {
 	interimCount     int
 }
 
+// googleSession bundles all per-session resources whose lifetimes are tied
+// to a single Google streaming RPC.
+type googleSession struct {
+	stream    speechpb.Speech_StreamingRecognizeClient
+	streamCtx context.Context
+	cancel    context.CancelFunc
+	recvDone  chan struct{}
+	state     *sessionState
+}
+
 // drainAudio reads chunks from a single audio_in channel until it closes or
 // the module shuts down. Manages the lifecycle of one Google session per
 // audio segment.
 func (s *googleCloudSTT) drainAudio(ctx context.Context, audioChan <-chan *audioin.AudioChunk) {
-	var (
-		gStream    speechpb.Speech_StreamingRecognizeClient
-		gStreamCtx context.Context
-		gCancel    context.CancelFunc
-		recvDone   chan struct{}
-		sess       *sessionState
-	)
-
-	closeGoogleSession := func(reason string) {
-		if gStream == nil {
-			return
+	var session *googleSession
+	defer func() {
+		if session != nil {
+			s.closeSession(ctx, session, "audio_in channel closed")
 		}
-		_ = gStream.CloseSend()
-		<-recvDone
-		gCancel()
-		// Normalize: a segment-end sentinel without any finals is a no-result.
-		// A recv error trumps the original reason.
-		normalized := reason
-		sess.mu.Lock()
-		finals := sess.finalCount
-		recvErr := sess.recvErr
-		sess.mu.Unlock()
-		switch {
-		case recvErr != nil:
-			normalized = "recv_error"
-		case reason == "segment-end sentinel" && finals > 0:
-			normalized = "success"
-		case reason == "segment-end sentinel" && finals == 0:
-			normalized = "no_result"
-		case reason == "audio_in channel closed":
-			normalized = "context_cancelled"
-		case reason == "send error":
-			normalized = "send_error"
-		}
-		s.logger.Infof("session closed (%s) audio_sent=%d bytes", normalized, sess.audioSent)
-		s.pushSessionCapture(ctx, sess, normalized)
-		gStream = nil
-		gStreamCtx = nil
-		gCancel = nil
-		recvDone = nil
-		sess = nil
-	}
-	defer closeGoogleSession("audio_in channel closed")
+	}()
 
 	for {
 		select {
@@ -448,81 +421,124 @@ func (s *googleCloudSTT) drainAudio(ctx context.Context, audioChan <-chan *audio
 				return // audio_in stream ended; outer loop will reopen
 			}
 			if len(chunk.AudioData) == 0 {
-				// Segment-end sentinel from filter-mic.
-				closeGoogleSession("segment-end sentinel")
+				if session != nil {
+					s.closeSession(ctx, session, "segment-end sentinel")
+					session = nil
+				}
 				continue
 			}
-			if gStream == nil {
-				// Lazily open a Google session on first non-empty chunk.
-				gStreamCtx, gCancel = context.WithTimeout(ctx, time.Duration(s.cfg.MaxSessionSeconds)*time.Second)
-				st, err := s.speechClient.StreamingRecognize(gStreamCtx)
+			if session == nil {
+				opened, err := s.openSession(ctx)
 				if err != nil {
-					s.logger.Warnf("open google stream: %v", err)
-					gCancel()
-					gStream = nil
-					gStreamCtx = nil
-					gCancel = nil
+					s.logger.Warnf("%v", err)
 					continue
 				}
-				configReq := &speechpb.StreamingRecognizeRequest{
-					Recognizer: fmt.Sprintf(
-						"projects/%s/locations/%s/recognizers/_",
-						s.projectID,
-						s.cfg.Location,
-					),
-					StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
-						StreamingConfig: &speechpb.StreamingRecognitionConfig{
-							Config: &speechpb.RecognitionConfig{
-								DecodingConfig: &speechpb.RecognitionConfig_ExplicitDecodingConfig{
-									ExplicitDecodingConfig: &speechpb.ExplicitDecodingConfig{
-										Encoding:          speechpb.ExplicitDecodingConfig_LINEAR16,
-										SampleRateHertz:   s.cfg.SampleRateHertz,
-										AudioChannelCount: 1,
-									},
-								},
-								LanguageCodes: []string{s.cfg.LanguageCode},
-								Model:         s.cfg.Model,
-							},
-							StreamingFeatures: &speechpb.StreamingRecognitionFeatures{
-								// Finals only — consumer only needs final transcripts.
-								InterimResults: false,
-							},
-						},
-					},
-				}
-				if err := st.Send(configReq); err != nil {
-					s.logger.Warnf("send config: %v", err)
-					gCancel()
-					gStream = nil
-					gStreamCtx = nil
-					gCancel = nil
-					continue
-				}
-				gStream = st
-				recvDone = make(chan struct{})
-				sess = &sessionState{
-					captureID: uuid.NewString(),
-					startedAt: time.Now(),
-				}
-				go s.receiveFromGoogle(ctx, st, sess, recvDone)
-				s.logger.Infof("session opened (first audio chunk) capture_id=%s", sess.captureID)
+				session = opened
 			}
-
 			audioReq := &speechpb.StreamingRecognizeRequest{
 				StreamingRequest: &speechpb.StreamingRecognizeRequest_Audio{
 					Audio: chunk.AudioData,
 				},
 			}
-			if err := gStream.Send(audioReq); err != nil {
+			if err := session.stream.Send(audioReq); err != nil {
 				s.logger.Warnf("send audio: %v", err)
-				sess.sendErr = err
-				closeGoogleSession("send error")
-			} else {
-				sess.audioSent += len(chunk.AudioData)
-				sess.audioBuf.Write(chunk.AudioData)
+				session.state.sendErr = err
+				s.closeSession(ctx, session, "send error")
+				session = nil
+				continue
 			}
+			session.state.audioSent += len(chunk.AudioData)
+			session.state.audioBuf.Write(chunk.AudioData)
 		}
 	}
+}
+
+// openSession opens a Google streaming RPC, sends the initial config, and
+// spawns the receive goroutine. Returns a ready-to-use session on success.
+func (s *googleCloudSTT) openSession(ctx context.Context) (*googleSession, error) {
+	streamCtx, cancel := context.WithTimeout(ctx, time.Duration(s.cfg.MaxSessionSeconds)*time.Second)
+	stream, err := s.speechClient.StreamingRecognize(streamCtx)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("open google stream: %w", err)
+	}
+	if err := stream.Send(s.configRequest()); err != nil {
+		cancel()
+		return nil, fmt.Errorf("send config: %w", err)
+	}
+	sess := &sessionState{
+		captureID: uuid.NewString(),
+		startedAt: time.Now(),
+	}
+	recvDone := make(chan struct{})
+	go s.receiveFromGoogle(ctx, stream, sess, recvDone)
+	s.logger.Debugf("session opened (first audio chunk) capture_id=%s", sess.captureID)
+	return &googleSession{
+		stream:    stream,
+		streamCtx: streamCtx,
+		cancel:    cancel,
+		recvDone:  recvDone,
+		state:     sess,
+	}, nil
+}
+
+// closeSession closes the Google stream, waits for the receive goroutine,
+// normalizes the close reason, logs, and pushes the session capture.
+func (s *googleCloudSTT) closeSession(ctx context.Context, session *googleSession, reason string) {
+	_ = session.stream.CloseSend()
+	<-session.recvDone
+	session.cancel()
+	normalized := normalizeCloseReason(reason, session.state)
+	s.logger.Debugf("session closed (%s) audio_sent=%d bytes", normalized, session.state.audioSent)
+	s.pushSessionCapture(ctx, session.state, normalized)
+}
+
+// configRequest builds the initial StreamingRecognize config message.
+func (s *googleCloudSTT) configRequest() *speechpb.StreamingRecognizeRequest {
+	return &speechpb.StreamingRecognizeRequest{
+		Recognizer: fmt.Sprintf("projects/%s/locations/%s/recognizers/_", s.projectID, s.cfg.Location),
+		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
+			StreamingConfig: &speechpb.StreamingRecognitionConfig{
+				Config: &speechpb.RecognitionConfig{
+					DecodingConfig: &speechpb.RecognitionConfig_ExplicitDecodingConfig{
+						ExplicitDecodingConfig: &speechpb.ExplicitDecodingConfig{
+							Encoding:          speechpb.ExplicitDecodingConfig_LINEAR16,
+							SampleRateHertz:   s.cfg.SampleRateHertz,
+							AudioChannelCount: 1,
+						},
+					},
+					LanguageCodes: []string{s.cfg.LanguageCode},
+					Model:         s.cfg.Model,
+				},
+				StreamingFeatures: &speechpb.StreamingRecognitionFeatures{
+					// Finals only — consumer only needs final transcripts.
+					InterimResults: false,
+				},
+			},
+		},
+	}
+}
+
+// normalizeCloseReason maps a raw close reason to one of the canonical
+// telemetry buckets. A recv error trumps the original reason.
+func normalizeCloseReason(reason string, sess *sessionState) string {
+	sess.mu.Lock()
+	finals := sess.finalCount
+	recvErr := sess.recvErr
+	sess.mu.Unlock()
+	switch {
+	case recvErr != nil:
+		return "recv_error"
+	case reason == "segment-end sentinel" && finals > 0:
+		return "success"
+	case reason == "segment-end sentinel" && finals == 0:
+		return "no_result"
+	case reason == "audio_in channel closed":
+		return "context_cancelled"
+	case reason == "send error":
+		return "send_error"
+	}
+	return reason
 }
 
 // receiveFromGoogle drains Google's response stream. For every final
@@ -533,7 +549,7 @@ func (s *googleCloudSTT) receiveFromGoogle(ctx context.Context, gStream speechpb
 	defer close(done)
 	defer func() {
 		sess.mu.Lock()
-		s.logger.Infof("google recv done: responses=%d finals=%d interims=%d", sess.respCount, sess.finalCount, sess.interimCount)
+		s.logger.Debugf("google recv done: responses=%d finals=%d interims=%d", sess.respCount, sess.finalCount, sess.interimCount)
 		sess.mu.Unlock()
 	}()
 	for {
@@ -593,7 +609,6 @@ func (s *googleCloudSTT) pushSessionCapture(ctx context.Context, sess *sessionSt
 	sess.mu.Unlock()
 
 	// Surface the underlying gRPC error for recv_error / send_error close
-	// paths so debugging doesn't require SSH'ing to the module logs.
 	errorMessage := ""
 	switch closeReason {
 	case "recv_error":
@@ -608,7 +623,7 @@ func (s *googleCloudSTT) pushSessionCapture(ctx context.Context, sess *sessionSt
 
 	wav, err := audioin.CreateWAVFile(sess.audioBuf.Bytes(), s.cfg.SampleRateHertz, 1, rutils.CodecPCM16)
 	if err != nil {
-		s.logger.Warnf("session-sensor: wrap PCM as WAV (capture_id=%s): %v", sess.captureID, err)
+		s.logger.Errorf("session-sensor: wrap PCM as WAV (capture_id=%s): %v", sess.captureID, err)
 		wav = nil
 	}
 	r := SessionReading{
@@ -630,17 +645,16 @@ func (s *googleCloudSTT) pushSessionCapture(ctx context.Context, sess *sessionSt
 	sink := s.sessionSink
 	logger := s.logger
 	go func() {
-		// Detach from caller's ctx — the audio loop may be tearing down.
+		// Detach from caller's ctx — the audio loop may be shutting down and don't want to stop the push.
 		pushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		binID, err := sink.PushSession(pushCtx, r)
 		if err != nil {
-			logger.Warnf("session-sensor push (capture_id=%s): %v", r.CaptureID, err)
+			logger.Errorf("session-sensor push failed (capture_id=%s): %v", r.CaptureID, err)
 			return
 		}
 		logger.Debugf("session-sensor push ok: capture_id=%s binary_data_id=%q close_reason=%s wav_bytes=%d", r.CaptureID, binID, r.CloseReason, len(r.WAV))
 	}()
-	_ = ctx // ctx intentionally unused — capture should survive the close path
 }
 
 // deliverFinal dispatches one final transcript. If transcript_target is

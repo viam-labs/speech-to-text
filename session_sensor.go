@@ -20,9 +20,7 @@ import (
 // On each push, the sensor uploads the session's WAV bytes to Viam's binary
 // store via BinaryDataCaptureUpload and includes the returned
 // binary_data_id in the queued tabular reading. Audio and metadata live in
-// separate Viam stores and link two ways: by binary_data_id and by matching
-// session timestamps (start_time/end_time on the tabular row mirror
-// time_requested/time_received on the binary record).
+// separate Viam stores and link two ways: by binary_data_id and by capture_id tag
 var SessionSensor = resource.NewModel("viam", "speech-to-text", "session-sensor")
 
 func init() {
@@ -37,17 +35,20 @@ type SessionSensorConfig struct {
 	// be routed into a named training/debug dataset in the Viam app.
 	DatasetIDs []string `json:"dataset_ids,omitempty"`
 
-	// ComponentName overrides the component name used in upload metadata.
-	// Defaults to the sensor's own resource name.
-	ComponentName string `json:"component_name,omitempty"`
-
 	// MaxQueueSize is a soft cap on pending readings. When exceeded, the
 	// oldest reading is dropped with a warning log. Default 1000.
 	MaxQueueSize int `json:"max_queue_size,omitempty"`
 }
 
-// Validate satisfies the resource config interface. No required fields.
-func (cfg *SessionSensorConfig) Validate(string) ([]string, []string, error) {
+func (cfg *SessionSensorConfig) Validate(path string) ([]string, []string, error) {
+	if cfg.MaxQueueSize < 0 {
+		return nil, nil, fmt.Errorf("%s: max_queue_size must be >= 0 (got %d)", path, cfg.MaxQueueSize)
+	}
+	for i, id := range cfg.DatasetIDs {
+		if id == "" {
+			return nil, nil, fmt.Errorf("%s: dataset_ids[%d] is empty", path, i)
+		}
+	}
 	return nil, nil, nil
 }
 
@@ -102,24 +103,24 @@ type sessionSensor struct {
 
 	mu      sync.Mutex
 	pending []map[string]interface{}
+	// lastReading is the most recent row pushed. Non-data-manager callers
+	// (Viam app live preview, Test panel, manual SDK calls) get this on
+	// Readings() so the UI doesn't flicker; data-manager polls keep strict
+	// queue-pop semantics so each row is captured exactly once.
+	lastReading map[string]interface{}
 
-	// uploader is nil if Viam app env vars were not set at startup.
-	// PushSession still queues the tabular reading in that case but skips
-	// the binary upload (binary_data_id will be empty in the reading).
 	viamClient *app.ViamClient
-	uploader   binaryUploader
+	uploader   binaryUploader // nil disables binary upload; tabular queue still works
 	partID     string
 }
 
 const (
 	defaultMaxQueueSize = 1000
 
-	// envPartID is read directly. VIAM_API_KEY and VIAM_API_KEY_ID are
-	// read by app.CreateViamClientFromEnvVars internally.
 	envPartID = "VIAM_MACHINE_PART_ID"
 
-	uploadMethod = "GetAudio"
-	uploadCType  = "rdk:component:audio_in"
+	uploadMethod = "Readings"
+	uploadCType  = "rdk:component:sensor"
 	uploadFExt   = ".wav"
 )
 
@@ -141,11 +142,10 @@ func newSessionSensor(ctx context.Context, _ resource.Dependencies, rawConf reso
 	// Lazily attempt to construct the Viam app client. If env vars are
 	// missing (e.g. running locally without VIAM_API_KEY set), the sensor
 	// still runs in "tabular-only" mode — binary uploads are skipped and
-	// queued readings carry an empty binary_data_id. Logged loudly so it's
-	// obvious in dev.
+	// queued readings carry an empty binary_data_id.
 	viamClient, err := app.CreateViamClientFromEnvVars(ctx, nil, logger)
 	if err != nil {
-		logger.Warnf("session-sensor: Viam app client unavailable (%v) — binary uploads disabled, tabular queue still works", err)
+		logger.Errorf("session-sensor: Viam app client unavailable (%v) — binary uploads disabled, tabular queue still works", err)
 	} else {
 		s.viamClient = viamClient
 		s.uploader = viamClient.DataClient()
@@ -167,16 +167,23 @@ func (s *sessionSensor) Status(context.Context) (map[string]interface{}, error) 
 	return map[string]interface{}{}, nil
 }
 
-func (s *sessionSensor) Readings(_ context.Context, _ map[string]interface{}) (map[string]interface{}, error) {
+func (s *sessionSensor) Readings(_ context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
+	fromDM, _ := extra[data.FromDMString].(bool)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.pending) == 0 {
-		return nil, data.ErrNoCaptureToStore
+	if fromDM {
+		if len(s.pending) == 0 {
+			return nil, data.ErrNoCaptureToStore
+		}
+		payload := s.pending[0]
+		s.pending[0] = nil
+		s.pending = s.pending[1:]
+		return payload, nil
 	}
-	payload := s.pending[0]
-	s.pending[0] = nil
-	s.pending = s.pending[1:]
-	return payload, nil
+	if s.lastReading != nil {
+		return s.lastReading, nil
+	}
+	return nil, data.ErrNoCaptureToStore
 }
 
 // DoCommand handles cross-process push from STT modules that can't import
@@ -221,15 +228,11 @@ func (s *sessionSensor) PushSession(ctx context.Context, r SessionReading) (stri
 			DatasetIDs:       s.cfg.DatasetIDs,
 			DataRequestTimes: &times,
 		}
-		componentName := s.cfg.ComponentName
-		if componentName == "" {
-			componentName = s.name.Name
-		}
 		binID, uploadErr = s.uploader.BinaryDataCaptureUpload(
-			ctx, r.WAV, s.partID, uploadCType, componentName, uploadMethod, uploadFExt, opts,
+			ctx, r.WAV, s.partID, uploadCType, s.name.Name, uploadMethod, uploadFExt, opts,
 		)
 		if uploadErr != nil {
-			s.logger.Warnf("session-sensor: binary upload failed for capture_id=%s: %v", r.CaptureID, uploadErr)
+			s.logger.Errorf("session-sensor: binary upload failed for capture_id=%s: %v", r.CaptureID, uploadErr)
 			binID = ""
 		}
 	} else if s.uploader == nil {
@@ -257,10 +260,10 @@ func (s *sessionSensor) PushSession(ctx context.Context, r SessionReading) (stri
 
 	s.mu.Lock()
 	s.pending = append(s.pending, reading)
+	s.lastReading = reading
 	if over := len(s.pending) - s.cfg.MaxQueueSize; over > 0 {
-		dropped := over
-		s.pending = s.pending[dropped:]
-		s.logger.Warnf("session-sensor: queue over MaxQueueSize=%d, dropped %d oldest reading(s)", s.cfg.MaxQueueSize, dropped)
+		s.pending = s.pending[over:]
+		s.logger.Warnf("session-sensor: queue over MaxQueueSize=%d, dropped %d oldest reading(s)", s.cfg.MaxQueueSize, over)
 	}
 	depth := len(s.pending)
 	s.mu.Unlock()

@@ -89,7 +89,7 @@ func sampleReading(captureID string) SessionReading {
 
 func TestReadingsEmptyQueueReturnsErrNoCaptureToStore(t *testing.T) {
 	s := newTestSensor(&fakeUploader{returnID: "ignored"}, 100)
-	_, err := s.Readings(context.Background(), nil)
+	_, err := s.Readings(context.Background(), data.FromDMExtraMap)
 	test.That(t, err, test.ShouldEqual, data.ErrNoCaptureToStore)
 }
 
@@ -102,7 +102,7 @@ func TestPushSessionQueuesAndReadingsReturnsIt(t *testing.T) {
 	test.That(t, binID, test.ShouldEqual, "binid-1")
 	test.That(t, up.callCount(), test.ShouldEqual, 1)
 
-	got, err := s.Readings(context.Background(), nil)
+	got, err := s.Readings(context.Background(), data.FromDMExtraMap)
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, got["capture_id"], test.ShouldEqual, "cap-1")
 	test.That(t, got["binary_data_id"], test.ShouldEqual, "binid-1")
@@ -110,7 +110,7 @@ func TestPushSessionQueuesAndReadingsReturnsIt(t *testing.T) {
 	test.That(t, got["close_reason"], test.ShouldEqual, "success")
 
 	// Queue should be empty again.
-	_, err = s.Readings(context.Background(), nil)
+	_, err = s.Readings(context.Background(), data.FromDMExtraMap)
 	test.That(t, err, test.ShouldEqual, data.ErrNoCaptureToStore)
 }
 
@@ -121,11 +121,11 @@ func TestPushSessionFIFOAcrossMultiplePushes(t *testing.T) {
 		test.That(t, err, test.ShouldBeNil)
 	}
 	for _, want := range []string{"a", "b", "c"} {
-		got, err := s.Readings(context.Background(), nil)
+		got, err := s.Readings(context.Background(), data.FromDMExtraMap)
 		test.That(t, err, test.ShouldBeNil)
 		test.That(t, got["capture_id"], test.ShouldEqual, want)
 	}
-	_, err := s.Readings(context.Background(), nil)
+	_, err := s.Readings(context.Background(), data.FromDMExtraMap)
 	test.That(t, err, test.ShouldEqual, data.ErrNoCaptureToStore)
 }
 
@@ -137,7 +137,7 @@ func TestPushSessionUploadErrorQueuesRowWithEmptyBinaryID(t *testing.T) {
 	test.That(t, err, test.ShouldNotBeNil)
 	test.That(t, binID, test.ShouldEqual, "")
 
-	got, err := s.Readings(context.Background(), nil)
+	got, err := s.Readings(context.Background(), data.FromDMExtraMap)
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, got["capture_id"], test.ShouldEqual, "cap-err")
 	test.That(t, got["binary_data_id"], test.ShouldEqual, "")
@@ -152,9 +152,9 @@ func TestPushSessionMaxQueueSizeDropsOldest(t *testing.T) {
 	}
 
 	// Queue capacity 2 — only the two newest survive.
-	got1, _ := s.Readings(context.Background(), nil)
-	got2, _ := s.Readings(context.Background(), nil)
-	_, err := s.Readings(context.Background(), nil)
+	got1, _ := s.Readings(context.Background(), data.FromDMExtraMap)
+	got2, _ := s.Readings(context.Background(), data.FromDMExtraMap)
+	_, err := s.Readings(context.Background(), data.FromDMExtraMap)
 
 	test.That(t, got1["capture_id"], test.ShouldEqual, "c")
 	test.That(t, got2["capture_id"], test.ShouldEqual, "d")
@@ -203,7 +203,7 @@ func TestDoCommandPushSessionRoundTrip(t *testing.T) {
 	test.That(t, up.callCount(), test.ShouldEqual, 1)
 	test.That(t, string(up.lastWAV), test.ShouldEqual, "RIFFfake")
 
-	got, err := s.Readings(context.Background(), nil)
+	got, err := s.Readings(context.Background(), data.FromDMExtraMap)
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, got["transcript"], test.ShouldEqual, "doc transcript")
 	test.That(t, got["binary_data_id"], test.ShouldEqual, "binid-doc")
@@ -215,6 +215,37 @@ func TestDoCommandUnknownCommandReturnsError(t *testing.T) {
 	test.That(t, err, test.ShouldNotBeNil)
 }
 
+func TestReadingsNonDMCallReturnsLastReadingWithoutDraining(t *testing.T) {
+	// Non-DM callers (UI live preview, Test panel) should see the most recent
+	// reading on every poll without consuming the queue. DM-flagged polls
+	// still get strict queue-pop semantics.
+	s := newTestSensor(&fakeUploader{returnID: "binid"}, 100)
+
+	// Empty: should still raise ErrNoCaptureToStore for non-DM callers too.
+	_, err := s.Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldEqual, data.ErrNoCaptureToStore)
+
+	_, err = s.PushSession(context.Background(), sampleReading("ui-1"))
+	test.That(t, err, test.ShouldBeNil)
+
+	// Multiple non-DM polls all return the same row, never empty.
+	for i := 0; i < 3; i++ {
+		got, err := s.Readings(context.Background(), nil)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, got["capture_id"], test.ShouldEqual, "ui-1")
+	}
+
+	// DM-flagged poll pops the row from the queue.
+	got, err := s.Readings(context.Background(), data.FromDMExtraMap)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, got["capture_id"], test.ShouldEqual, "ui-1")
+
+	// Queue now empty, but non-DM polls still see the sticky last reading.
+	got, err = s.Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, got["capture_id"], test.ShouldEqual, "ui-1")
+}
+
 func TestPushSessionWithoutUploaderStillQueuesRow(t *testing.T) {
 	// Simulate the "no Viam app creds" path: uploader is nil. PushSession
 	// should still queue the row with an empty binary_data_id.
@@ -224,8 +255,36 @@ func TestPushSessionWithoutUploaderStillQueuesRow(t *testing.T) {
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, binID, test.ShouldEqual, "")
 
-	got, err := s.Readings(context.Background(), nil)
+	got, err := s.Readings(context.Background(), data.FromDMExtraMap)
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, got["capture_id"], test.ShouldEqual, "cap-no-upload")
 	test.That(t, got["binary_data_id"], test.ShouldEqual, "")
+}
+
+func TestValidateAcceptsZeroAndPositiveMaxQueueSize(t *testing.T) {
+	for _, v := range []int{0, 1, 1000} {
+		cfg := &SessionSensorConfig{MaxQueueSize: v}
+		_, _, err := cfg.Validate("test")
+		test.That(t, err, test.ShouldBeNil)
+	}
+}
+
+func TestValidateRejectsNegativeMaxQueueSize(t *testing.T) {
+	cfg := &SessionSensorConfig{MaxQueueSize: -1}
+	_, _, err := cfg.Validate("test")
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, "max_queue_size")
+}
+
+func TestValidateRejectsEmptyDatasetID(t *testing.T) {
+	cfg := &SessionSensorConfig{DatasetIDs: []string{"good", "", "alsogood"}}
+	_, _, err := cfg.Validate("test")
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, "dataset_ids[1]")
+}
+
+func TestValidateAcceptsAllNonEmptyDatasetIDs(t *testing.T) {
+	cfg := &SessionSensorConfig{DatasetIDs: []string{"a", "b"}}
+	_, _, err := cfg.Validate("test")
+	test.That(t, err, test.ShouldBeNil)
 }

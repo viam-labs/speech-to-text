@@ -20,35 +20,11 @@ The sensor accepts pushes two ways:
 
 Both paths converge on the same internal queue + binary upload.
 
-## Wire shape
-
-```
-STT module ──► PushSession({wav, transcript, close_reason, ...})
-                    │
-                    ▼
-   session-sensor:
-     1. BinaryDataCaptureUpload(wav)  → binary_data_id
-     2. append {binary_data_id, transcript, close_reason, ...} to queue
-                    │
-                    ▼
-   Viam data manager polls Readings() at configured cadence:
-     queue empty → ErrNoCaptureToStore (data manager skips poll)
-     queue has rows → return oldest reading
-                    │
-                    ▼
-   Viam cloud:
-     binary record (WAV, tagged with capture_<id>)
-     tabular row (one per session, contains binary_data_id)
-     joined by binary_data_id in MQL
-```
 
 ## Configuration
 
 ```json
 {
-  "dataset_ids": ["<viam dataset id>"],
-  "component_name": "<override>",
-  "max_queue_size": 1000
 }
 ```
 
@@ -56,9 +32,8 @@ STT module ──► PushSession({wav, transcript, close_reason, ...})
 
 | Name             | Type     | Inclusion | Description                                                                                                                |
 |------------------|----------|-----------|----------------------------------------------------------------------------------------------------------------------------|
-| `dataset_ids`    | string[] | Optional  | Dataset IDs attached to each binary upload — routes captured WAVs into a named training/debug dataset in the Viam app.     |
-| `component_name` | string   | Optional  | Overrides the component name in upload metadata. Defaults to the sensor's own resource name.                               |
-| `max_queue_size` | int      | Optional  | Soft cap on pending readings. When exceeded, the oldest reading is dropped with a warning. Defaults to `1000`.              |
+| `dataset_ids`    | string[] | Optional  | Dataset IDs attached to each binary upload — routes captured WAVs into a named training/debug dataset in the Viam app. All entries must be non-empty strings. |
+| `max_queue_size` | int      | Optional  | Soft cap on pending readings. When exceeded, the oldest reading is dropped with a warning. Must be `>= 0`; `0` (or unset) applies the default of `1000`. |
 
 ### Environment variables
 
@@ -151,10 +126,11 @@ What lands in Viam cloud per session (the queued reading returned by
 The binary blob (WAV) and the tabular reading land in **separate Viam stores**
 and link two ways:
 
-- **By `binary_data_id`** — primary join key. The tabular row carries it; the
-  binary record is keyed by it. Join on this field in MQL.
-- **By timestamps** — fallback / sanity-check link. The binary record's
-  `time_requested` / `time_received` mirror the row's `start_time` / `end_time`.
+- **By `binary_data_id`** — the tabular row carries it; the binary record is
+  keyed by it.
+- **By `capture_id` tag** — the tabular row carries `capture_id` directly; the
+  binary record is tagged with `capture_<capture_id>`. Useful for
+  human-readable filtering in the Data tab.
 
 ### Binary upload tags
 

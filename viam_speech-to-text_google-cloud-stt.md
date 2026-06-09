@@ -43,8 +43,10 @@ The following attribute template can be used to configure this model:
   "google_credentials_json": { },
   "language_code": "en-US",
   "model": "latest_short",
+  "location": "global",
   "sample_rate_hertz": 16000,
-  "max_session_seconds": 290
+  "max_session_seconds": 290,
+  "session_sensor_name": "<session-sensor component name>"
 }
 ```
 
@@ -56,9 +58,11 @@ The following attribute template can be used to configure this model:
 | `transcript_target`       | string  | Optional  | Resource name of a generic resource to receive `deliverTranscript` DoCommand calls. If empty, the module runs in log-only mode.                   |
 | `google_credentials_json` | object  | Required  | Inline GCP service-account JSON. The `project_id` field is read from this to build the v2 recognizer path.                                        |
 | `language_code`           | string  | Optional  | Recognition language. Defaults to `en-US`.                                                                                                        |
-| `model`                   | string  | Optional  | Recognition model. v2 supports `latest_short` (default, for commands), `latest_long`, `chirp_2`, etc.                                             |
+| `model`                   | string  | Optional  | Recognition model. v2 supports `latest_short` (default, for commands), `latest_long`, `chirp_2`, `chirp_3`, etc.                                  |
+| `location`                | string  | Optional  | Google Cloud region for the Speech v2 recognizer. Defaults to `global`. Regional models like `chirp_2` require a regional endpoint (e.g. `us-central1`). |
 | `sample_rate_hertz`       | int     | Optional  | Sample rate of the input audio. Defaults to `16000`.                                                                                              |
 | `max_session_seconds`     | int     | Optional  | Caps a single Google streaming session. Google's hard cap is 305s; defaults to `290`.                                                             |
+| `session_sensor_name`     | string  | Optional  | Resource name of a `viam:speech-to-text:session-sensor` to capture per-session audio + metadata to the Viam Data tab. If empty, capture is disabled. See [the session-sensor model docs](viam_speech-to-text_session-sensor.md). |
 
 ### Example Configuration
 

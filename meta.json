@@ -3,7 +3,21 @@
   "module_id": "viam:speech-to-text",
   "visibility": "public",
   "url": "https://github.com/viam-labs/speech-to-text",
-  "description": "Modular generic component: google-cloud-stt",
+  "description": "Speech-to-text components: google-cloud-stt + session-sensor capture",
+  "models": [
+    {
+      "api": "rdk:component:generic",
+      "model": "viam:speech-to-text:google-cloud-stt",
+      "markdown_link": "README.md#model-viamspeech-to-textgoogle-cloud-stt",
+      "short_description": "Streams audio from an audio_in source to Google Cloud STT and dispatches final transcripts."
+    },
+    {
+      "api": "rdk:component:sensor",
+      "model": "viam:speech-to-text:session-sensor",
+      "markdown_link": "README.md#model-viamspeech-to-textsession-sensor",
+      "short_description": "Queues per-session capture records and uploads the corresponding WAV to Viam's binary store."
+    }
+  ],
   "applications": null,
   "markdown_link": "README.md",
   "entrypoint": "bin/speech-to-text",

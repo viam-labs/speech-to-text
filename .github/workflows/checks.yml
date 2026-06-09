@@ -1,0 +1,22 @@
+name: run unit tests and linter
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/viamrobotics/rdk-devenv:amd64
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    - name: Install Dependencies
+      run: make setup
+    - name: Run linter
+      run: make lint
+    - name: Run unit tests
+      run: make test

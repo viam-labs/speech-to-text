@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -577,8 +578,14 @@ func (s *googleCloudSTT) receiveFromGoogle(ctx context.Context, gStream speechpb
 				sess.mu.Unlock()
 				continue
 			}
-			text := result.Alternatives[0].Transcript
-			conf := result.Alternatives[0].Confidence
+			// models sometimes rank an empty hypothesis first, or emit
+			// a final with no text. skip any finals with no text so
+			// finalCount stays 0 and the session closes as no_result
+			// instead of success.
+			text, conf := firstNonEmptyAlternative(result.Alternatives)
+			if text == "" {
+				continue
+			}
 			sess.mu.Lock()
 			sess.finalCount++
 			sess.latestTranscript = text
@@ -587,6 +594,17 @@ func (s *googleCloudSTT) receiveFromGoogle(ctx context.Context, gStream speechpb
 			s.deliverFinal(ctx, text, conf)
 		}
 	}
+}
+
+// firstNonEmptyAlternative returns the highest-ranked alternative with a
+// non-blank transcript, or "" if no alternative has usable text.
+func firstNonEmptyAlternative(alts []*speechpb.SpeechRecognitionAlternative) (string, float32) {
+	for _, alt := range alts {
+		if strings.TrimSpace(alt.Transcript) != "" {
+			return alt.Transcript, alt.Confidence
+		}
+	}
+	return "", 0
 }
 
 // pushSessionCapture snapshots the session state and forwards it to the

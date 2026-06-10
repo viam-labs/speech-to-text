@@ -8,13 +8,13 @@
     {
       "api": "rdk:component:generic",
       "model": "viam:speech-to-text:google-cloud-stt",
-      "markdown_link": "README.md#model-viamspeech-to-textgoogle-cloud-stt",
+      "markdown_link": "viam_speech-to-text_google-cloud-stt.md#model-viamspeech-to-textgoogle-cloud-stt",
       "short_description": "Streams audio from an audio_in source to Google Cloud STT and dispatches final transcripts."
     },
     {
       "api": "rdk:component:sensor",
       "model": "viam:speech-to-text:session-sensor",
-      "markdown_link": "README.md#model-viamspeech-to-textsession-sensor",
+      "markdown_link": "viam_speech-to-text_session-sensor.md#model-viamspeech-to-textsession-sensor",
       "short_description": "Queues per-session capture records and uploads the corresponding WAV to Viam's binary store."
     }
   ],

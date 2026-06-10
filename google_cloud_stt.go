@@ -39,8 +39,11 @@ import (
 	speechpb "cloud.google.com/go/speech/apiv2/speechpb"
 	"github.com/google/uuid"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	audioin "go.viam.com/rdk/components/audioin"
 	generic "go.viam.com/rdk/components/generic"
@@ -103,6 +106,19 @@ type Config struct {
 	// MaxSessionSeconds caps a single Google streaming session. Google's
 	// hard cap is 305s; defaults to 290s.
 	MaxSessionSeconds int `json:"max_session_seconds,omitempty"`
+
+	// SpeechEndTimeoutMs sets VoiceActivityTimeout.speech_end_timeout: after
+	// this many milliseconds of detected silence, Google emits a final result
+	// and closes the stream without waiting for an explicit CloseSend. This
+	// lets transcripts arrive before the audio-segment sentinel, cutting
+	// end-to-end latency by the amount of trailing silence in the clip.
+	//
+	// Defaults to 0 (disabled). Only enable this for audio that is known to
+	// be short, continuous utterances without internal pauses longer than this
+	// threshold — a value shorter than any in-utterance pause will cause Google
+	// to fire early, producing partial or empty transcripts. A value of 1500ms
+	// is a reasonable starting point for single-sentence voice commands.
+	SpeechEndTimeoutMs int `json:"speech_end_timeout_ms,omitempty"`
 
 	// SessionSensorName is the Viam resource name of a session-sensor
 	// component that captures per-session WAV + metadata for the Data tab.
@@ -171,7 +187,6 @@ func NewGoogleCloudSTT(ctx context.Context, deps resource.Dependencies, name res
 	if conf.Location == "" {
 		conf.Location = "global"
 	}
-
 	projectID, _ := conf.GoogleCredentialsJSON["project_id"].(string)
 	if projectID == "" {
 		return nil, fmt.Errorf("google_credentials_json missing project_id field")
@@ -214,6 +229,15 @@ func NewGoogleCloudSTT(ctx context.Context, deps resource.Dependencies, name res
 	if conf.Location != "global" {
 		clientOpts = append(clientOpts, option.WithEndpoint(fmt.Sprintf("%s-speech.googleapis.com:443", conf.Location)))
 	}
+	// Keep the underlying gRPC connection alive between streaming sessions so
+	// the first session after an idle period doesn't pay a full TLS handshake.
+	clientOpts = append(clientOpts, option.WithGRPCDialOption(
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	))
 	speechClient, err := speech.NewClient(ctx, clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create google speech client: %w", err)
@@ -407,6 +431,7 @@ type googleSession struct {
 // audio segment.
 func (s *googleCloudSTT) drainAudio(ctx context.Context, audioChan <-chan *audioin.AudioChunk) {
 	var session *googleSession
+	var sessionBenchStart time.Time
 	defer func() {
 		if session != nil {
 			s.closeSession(ctx, session, "audio_in channel closed")
@@ -424,12 +449,26 @@ func (s *googleCloudSTT) drainAudio(ctx context.Context, audioChan <-chan *audio
 			if len(chunk.AudioData) == 0 {
 				if session != nil {
 					s.closeSession(ctx, session, "segment-end sentinel")
+					s.logger.Infof("[BENCHMARK] %d session_e2e_us=%d", time.Now().UnixMicro(), time.Since(sessionBenchStart).Microseconds())
 					session = nil
 				}
 				continue
 			}
+			if session != nil {
+				select {
+				case <-session.recvDone:
+					s.closeSession(ctx, session, "recv died")
+					s.logger.Infof("[BENCHMARK] %d session_e2e_us=%d", time.Now().UnixMicro(), time.Since(sessionBenchStart).Microseconds())
+					session = nil
+				default:
+				}
+			}
 			if session == nil {
+				sessionBenchStart = time.Now()
+				s.logger.Infof("[BENCHMARK] %d session_open_start", sessionBenchStart.UnixMicro())
 				opened, err := s.openSession(ctx)
+				openDur := time.Since(sessionBenchStart)
+				s.logger.Infof("[BENCHMARK] %d session_open_us=%d", time.Now().UnixMicro(), openDur.Microseconds())
 				if err != nil {
 					s.logger.Warnf("%v", err)
 					continue
@@ -442,9 +481,19 @@ func (s *googleCloudSTT) drainAudio(ctx context.Context, audioChan <-chan *audio
 				},
 			}
 			if err := session.stream.Send(audioReq); err != nil {
-				s.logger.Warnf("send audio: %v", err)
-				session.state.sendErr = err
-				s.closeSession(ctx, session, "send error")
+				if err == io.EOF {
+					// Google closed the stream before we finished sending — the
+					// expected race when VoiceActivityTimeout fires and recvDone
+					// closes between the non-blocking select above and this Send.
+					// Not an error; normalizeCloseReason maps "recv died" + finals
+					// to success.
+					s.closeSession(ctx, session, "recv died")
+				} else {
+					s.logger.Warnf("send audio: %v", err)
+					session.state.sendErr = err
+					s.closeSession(ctx, session, "send error")
+				}
+				s.logger.Infof("[BENCHMARK] %d session_e2e_us=%d", time.Now().UnixMicro(), time.Since(sessionBenchStart).Microseconds())
 				session = nil
 				continue
 			}
@@ -490,12 +539,34 @@ func (s *googleCloudSTT) closeSession(ctx context.Context, session *googleSessio
 	<-session.recvDone
 	session.cancel()
 	normalized := normalizeCloseReason(reason, session.state)
+	if normalized != "success" {
+		s.logger.Infof("transcription unsuccessful (%s)", normalized)
+	}
 	s.logger.Debugf("session closed (%s) audio_sent=%d bytes", normalized, session.state.audioSent)
 	s.pushSessionCapture(ctx, session.state, normalized)
 }
 
 // configRequest builds the initial StreamingRecognize config message.
 func (s *googleCloudSTT) configRequest() *speechpb.StreamingRecognizeRequest {
+	features := &speechpb.StreamingRecognitionFeatures{
+		InterimResults: false,
+	}
+	if s.cfg.SpeechEndTimeoutMs > 0 {
+		// Let Google detect end-of-speech and close the stream autonomously.
+		// The final transcript arrives before the FakeMic sentinel fires,
+		// cutting post-audio latency by the trailing-silence duration.
+		//
+		// speech_start_timeout must be set explicitly alongside speech_end_timeout.
+		// When the VoiceActivityTimeout struct is provided but speech_start_timeout
+		// is absent (nil/zero in proto3), Google treats it as a zero-duration start
+		// timeout and immediately cancels any stream where speech isn't detected in
+		// the first few frames. Setting it to MaxSessionSeconds prevents that while
+		// still allowing speech_end_timeout to fire early once speech has ended.
+		features.VoiceActivityTimeout = &speechpb.StreamingRecognitionFeatures_VoiceActivityTimeout{
+			SpeechStartTimeout: durationpb.New(time.Duration(s.cfg.MaxSessionSeconds) * time.Second),
+			SpeechEndTimeout:   durationpb.New(time.Duration(s.cfg.SpeechEndTimeoutMs) * time.Millisecond),
+		}
+	}
 	return &speechpb.StreamingRecognizeRequest{
 		Recognizer: fmt.Sprintf("projects/%s/locations/%s/recognizers/_", s.projectID, s.cfg.Location),
 		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
@@ -511,10 +582,7 @@ func (s *googleCloudSTT) configRequest() *speechpb.StreamingRecognizeRequest {
 					LanguageCodes: []string{s.cfg.LanguageCode},
 					Model:         s.cfg.Model,
 				},
-				StreamingFeatures: &speechpb.StreamingRecognitionFeatures{
-					// Finals only — consumer only needs final transcripts.
-					InterimResults: false,
-				},
+				StreamingFeatures: features,
 			},
 		},
 	}
@@ -534,6 +602,14 @@ func normalizeCloseReason(reason string, sess *sessionState) string {
 		return "success"
 	case reason == "segment-end sentinel" && finals == 0:
 		return "no_result"
+	// VoiceActivityTimeout causes Google to close the stream server-side after
+	// emitting a final, so drainAudio sees recvDone before the sentinel arrives
+	// and calls closeSession("recv died"). With no recv error and a final in
+	// hand, this is a clean success — not a failure.
+	case reason == "recv died" && recvErr == nil && finals > 0:
+		return "success"
+	case reason == "recv died" && finals == 0:
+		return "no_result"
 	case reason == "audio_in channel closed":
 		return "context_cancelled"
 	case reason == "send error":
@@ -552,9 +628,16 @@ func (s *googleCloudSTT) receiveFromGoogle(ctx context.Context, gStream speechpb
 		sess.mu.Lock()
 		s.logger.Debugf("google recv done: responses=%d finals=%d interims=%d", sess.respCount, sess.finalCount, sess.interimCount)
 		sess.mu.Unlock()
+		// Time from session open to recv goroutine exit. With VoiceActivityTimeout
+		// this closes as soon as Google emits the final; without it, it closes
+		// after the CloseSend handshake. Comparing this to final_transcript_us
+		// shows stream teardown overhead.
+		s.logger.Infof("[BENCHMARK] %d recv_done_us=%d", time.Now().UnixMicro(), time.Since(sess.startedAt).Microseconds())
 	}()
 	for {
+		recvStart := time.Now()
 		resp, err := gStream.Recv()
+		s.logger.Infof("[BENCHMARK] %d recv_us=%d", time.Now().UnixMicro(), time.Since(recvStart).Microseconds())
 		if err == io.EOF {
 			return
 		}
@@ -591,6 +674,12 @@ func (s *googleCloudSTT) receiveFromGoogle(ctx context.Context, gStream speechpb
 			sess.latestTranscript = text
 			sess.latestConfidence = float64(conf)
 			sess.mu.Unlock()
+			// Time from session open to this final landing in our recv goroutine.
+			// This is the earliest moment the transcript is in hand. With
+			// VoiceActivityTimeout it fires before the audio sentinel; comparing
+			// it to recv_done_us and session_e2e_us shows how much of the latency
+			// is stream teardown vs. post-session overhead.
+			s.logger.Infof("[BENCHMARK] %d final_transcript_us=%d", time.Now().UnixMicro(), time.Since(sess.startedAt).Microseconds())
 			s.deliverFinal(ctx, text, conf)
 		}
 	}
@@ -678,12 +767,13 @@ func (s *googleCloudSTT) pushSessionCapture(ctx context.Context, sess *sessionSt
 // deliverFinal dispatches one final transcript. If transcript_target is
 // configured, calls its DoCommand. Otherwise just logs.
 func (s *googleCloudSTT) deliverFinal(ctx context.Context, text string, confidence float32) {
-	s.logger.Debugf("FINAL: %q (conf=%.2f)", text, confidence)
+	s.logger.Infof("transcript: %q (confidence=%.2f)", text, confidence)
 	if s.transcriptTarget == nil {
 		return
 	}
 	doCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	deliverStart := time.Now()
 	_, err := s.transcriptTarget.DoCommand(doCtx, map[string]interface{}{
 		"command":    "deliverTranscript",
 		"transcript": text,
@@ -691,6 +781,9 @@ func (s *googleCloudSTT) deliverFinal(ctx context.Context, text string, confiden
 		"confidence": float64(confidence),
 		"source":     "google-cloud-stt",
 	})
+	// Round-trip time for the DoCommand call to transcript_target. A slow
+	// downstream consumer adds directly to user-perceived latency.
+	s.logger.Infof("[BENCHMARK] %d deliver_final_us=%d", time.Now().UnixMicro(), time.Since(deliverStart).Microseconds())
 	if err != nil {
 		s.logger.Warnf("deliverTranscript to %s: %v",
 			s.cfg.TranscriptTarget, err)

@@ -148,6 +148,12 @@ func TestNormalizeCloseReason(t *testing.T) {
 		{"recv error trumps finals", "segment-end sentinel", &sessionState{finalCount: 1, recvErr: errors.New("boom")}, "recv_error"},
 		{"audio_in closed", "audio_in channel closed", &sessionState{}, "context_cancelled"},
 		{"send error", "send error", &sessionState{}, "send_error"},
+		// VoiceActivityTimeout: Google closes the stream server-side after emitting
+		// a final, so drainAudio sees recvDone close and uses "recv died" as the
+		// reason. With no recv error and a usable final in hand, it's a success.
+		{"recv died with final (VAT success)", "recv died", &sessionState{finalCount: 1}, "success"},
+		{"recv died with no final", "recv died", &sessionState{}, "no_result"},
+		{"recv died with recv error", "recv died", &sessionState{finalCount: 1, recvErr: errors.New("boom")}, "recv_error"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := normalizeCloseReason(tc.reason, tc.sess); got != tc.want {

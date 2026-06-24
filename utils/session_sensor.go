@@ -70,11 +70,6 @@ type SessionReading struct {
 	ResponseCount  int
 	FinalCount     int
 	InterimCount   int
-
-	// Timing metrics in microseconds. SessionOpenUs is filled by the shared
-	// listener for every provider; RecvUs comes from the provider session.
-	SessionOpenUs int64 // time to open the provider session
-	RecvUs        int64 // provider-defined receive latency
 }
 
 // SessionSensorSink is the in-process push API for STT models in this repo.
@@ -260,8 +255,6 @@ func (s *sessionSensor) PushSession(ctx context.Context, r SessionReading) (stri
 		"response_count":   r.ResponseCount,
 		"final_count":      r.FinalCount,
 		"interim_count":    r.InterimCount,
-		"session_open_us":  r.SessionOpenUs,
-		"recv_us":          r.RecvUs,
 		"captured_at":      time.Now().UTC().Format(time.RFC3339Nano),
 	}
 
@@ -344,12 +337,6 @@ func parsePushPayload(cmd map[string]interface{}) (SessionReading, error) {
 	}
 	if n, ok := cmd["interim_count"].(float64); ok {
 		r.InterimCount = int(n)
-	}
-	if n, ok := cmd["session_open_us"].(float64); ok {
-		r.SessionOpenUs = int64(n)
-	}
-	if n, ok := cmd["recv_us"].(float64); ok {
-		r.RecvUs = int64(n)
 	}
 	return r, nil
 }

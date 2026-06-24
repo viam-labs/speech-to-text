@@ -702,7 +702,6 @@ func (es *elevenLabsSession) Finish(ctx context.Context, reason string) (utils.S
 		ResponseCount: partialCount + finalCount,
 		FinalCount:    finalCount,
 		InterimCount:  partialCount,
-		RecvUs:        recvUs,
 	}, nil
 }
 

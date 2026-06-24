@@ -87,8 +87,6 @@ Optional fields (all default to empty / zero):
 | `response_count`    | int    | Total backend responses received during the session.                                                |
 | `final_count`       | int    | Number of finals received.                                                                           |
 | `interim_count`     | int    | Number of interim/partial results received.                                                          |
-| `session_open_us`   | int    | Microseconds to open the backend session.                                                            |
-| `recv_us`           | int    | Backend receive latency in microseconds (ElevenLabs: commit → committed transcript).                 |
 
 Response:
 
@@ -121,8 +119,6 @@ What lands in Viam cloud per session (the queued reading returned by
 | `response_count`     | int              | Total backend responses received during the session.                                           |
 | `final_count`        | int              | Number of finals received.                                                                      |
 | `interim_count`      | int              | Number of interim/partial results received.                                                     |
-| `session_open_us`    | int              | Microseconds to open the backend session.                                                       |
-| `recv_us`            | int              | Backend receive latency in microseconds (ElevenLabs: commit → committed transcript).            |
 | `captured_at`        | RFC3339Nano      | When the sensor appended the reading (server-side).                                            |
 
 ## Binary record ↔ tabular row linking

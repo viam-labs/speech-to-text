@@ -142,12 +142,10 @@ func (l *Listener) runListener(ctx context.Context) {
 // owned here (provider-agnostic); transcription is delegated to the session.
 func (l *Listener) drainAudio(ctx context.Context, audioChan <-chan *audioin.AudioChunk) {
 	var session ProviderSession
-	var benchStart time.Time
 	var captureID string
 	var startedAt time.Time
 	var audioBuf bytes.Buffer
 	var audioSent int
-	var sessionOpenUs int64
 
 	// deliver dispatches a final transcript. Google calls it from its recv
 	// goroutine; ElevenLabs calls it inside Finish on the same goroutine.
@@ -165,7 +163,6 @@ func (l *Listener) drainAudio(ctx context.Context, audioChan <-chan *audioin.Aud
 		reading.AudioSentBytes = audioSent
 		reading.StartTime = startedAt
 		reading.EndTimeUs = time.Now().UnixMicro()
-		reading.SessionOpenUs = sessionOpenUs
 		wav, err := audioin.CreateWAVFile(audioBuf.Bytes(), l.SampleRate, 1, rutils.CodecPCM16)
 		if err != nil {
 			l.Logger.Errorf("session-sensor: wrap PCM as WAV (capture_id=%s): %v", captureID, err)
@@ -211,13 +208,11 @@ func (l *Listener) drainAudio(ctx context.Context, audioChan <-chan *audioin.Aud
 				}
 			}
 			if session == nil {
-				benchStart = time.Now()
 				captureID = uuid.NewString()
-				startedAt = benchStart
+				startedAt = time.Now()
 				audioBuf.Reset()
 				audioSent = 0
 				opened, err := l.Transcriber.OpenSession(ctx, deliver)
-				sessionOpenUs = time.Since(benchStart).Microseconds()
 				if err != nil {
 					l.Logger.Warnf("%v", err)
 					continue

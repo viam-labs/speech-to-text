@@ -13,8 +13,8 @@ Use it to:
 The sensor accepts pushes two ways:
 
 - **In-process Go interface** (`SessionSensorSink`) — STT models in this repo
-  (e.g. `google-cloud-stt`) call `PushSession(ctx, SessionReading)` directly.
-  Zero gRPC overhead.
+  (`google-cloud-stt`, `elevenlabs-stt`) call `PushSession(ctx, SessionReading)`
+  directly. Zero gRPC overhead.
 - **`DoCommand({"command": "push_session", ...})`** — STT modules in other
   repos push over gRPC with `audio_wav_b64` in the payload.
 
@@ -69,7 +69,7 @@ Required fields:
   "capture_id": "<uuid>",
   "close_reason": "success",
   "start_time": "<RFC3339Nano>",
-  "end_time": "<RFC3339Nano>"
+  "end_time_us": 1782156234078695
 }
 ```
 
@@ -77,16 +77,18 @@ Optional fields (all default to empty / zero):
 
 | Field             | Type   | Notes                                                                                                |
 |-------------------|--------|------------------------------------------------------------------------------------------------------|
-| `audio_wav_b64`   | string | Base64-encoded WAV bytes (16 kHz mono PCM16). Transport-only — uploaded to binary store, not stored. |
-| `transcript`      | string | Final transcript. Empty for `no_result`/error close paths.                                           |
-| `confidence`      | float  | 0.0 ≤ x ≤ 1.0. Note: Google v2 documents this as unreliable / not always populated.                  |
-| `error_message`   | string | Underlying gRPC error from Google for `recv_error`/`send_error` close paths.                         |
-| `audio_sent_bytes`| int    | Bytes forwarded to STT backend.                                                                      |
-| `language_code`   | string | e.g. `"en-US"`.                                                                                      |
-| `model`           | string | STT model identifier.                                                                                |
-| `response_count`  | int    | Google streaming response count.                                                                     |
-| `final_count`     | int    | Number of finals received.                                                                           |
-| `interim_count`   | int    | Number of interim results received.                                                                  |
+| `audio_wav_b64`     | string | Base64-encoded WAV bytes (16 kHz mono PCM16). Transport-only — uploaded to binary store, not stored. |
+| `transcript`        | string | Final transcript. Empty for `no_result`/error close paths.                                           |
+| `confidence`        | float  | `0.0` ≤ x ≤ `1.0`. Google v2 documents this as unreliable / not always populated; ElevenLabs always sends `0.0`. |
+| `error_message`     | string | Underlying error for error close paths (e.g. the gRPC error from Google).                            |
+| `audio_sent_bytes`  | int    | Bytes forwarded to the STT backend.                                                                  |
+| `language_code`     | string | e.g. `"en-US"` (Google) or `"en"` (ElevenLabs).                                                      |
+| `model`             | string | STT model identifier.                                                                                |
+| `response_count`    | int    | Total backend responses received during the session.                                                |
+| `final_count`       | int    | Number of finals received.                                                                           |
+| `interim_count`     | int    | Number of interim/partial results received.                                                          |
+| `session_open_us`   | int    | Microseconds to open the backend session.                                                            |
+| `recv_us`           | int    | Backend receive latency in microseconds (ElevenLabs: commit → committed transcript).                 |
 
 Response:
 
@@ -107,19 +109,21 @@ What lands in Viam cloud per session (the queued reading returned by
 | `capture_id`       | string           | UUID generated at session open by the STT module.                                              |
 | `binary_data_id`   | string           | Returned by `BinaryDataCaptureUpload`. Empty if upload failed.                                 |
 | `transcript`       | string           | Final transcript. Empty for no-result/error.                                                   |
-| `confidence`       | float            | 0 = not set (documented sentinel per Google v2).                                               |
-| `close_reason`     | string           | One of `success`, `no_result`, `send_error`, `recv_error`, `timeout`, `context_cancelled`.     |
-| `error_message`    | string           | Underlying gRPC error for error close paths; empty otherwise.                                  |
-| `audio_sent_bytes` | int              | Bytes forwarded to STT backend during the session.                                             |
-| `start_time`       | RFC3339Nano      | Session-open timestamp. Also stamped on the binary record as `time_requested`.                 |
-| `end_time`         | RFC3339Nano      | Session-close timestamp. Also stamped on the binary record as `time_received`.                 |
-| `duration_ms`      | float            | `end_time - start_time` in ms.                                                                 |
-| `language_code`    | string           | e.g. `"en-US"`.                                                                                |
-| `model`            | string           | STT model identifier.                                                                          |
-| `response_count`   | int              | Google streaming response count.                                                               |
-| `final_count`      | int              | Number of finals received.                                                                     |
-| `interim_count`   | int              | Number of interim results received.                                                            |
-| `captured_at`      | RFC3339Nano      | When the sensor appended the reading (server-side).                                            |
+| `confidence`         | float            | `0` = not set (Google v2 sentinel; ElevenLabs always `0`).                                     |
+| `close_reason`       | string           | `success`, `no_result`, `context_cancelled`; plus `send_error`/`recv_error`/`timeout` (Google) and `ws_error`/`timeout` (ElevenLabs). |
+| `error_message`      | string           | Underlying error for error close paths; empty otherwise.                                       |
+| `audio_sent_bytes`   | int              | Bytes forwarded to the STT backend during the session.                                         |
+| `start_time`         | RFC3339Nano      | Session-open timestamp. Also stamped on the binary record as `time_requested`.                 |
+| `end_time_us`        | int              | Session-close time, Unix microseconds. Also stamped on the binary record as `time_received`.   |
+| `duration_ms`        | float            | `end_time_us - start_time` in ms (microsecond precision).                                       |
+| `language_code`      | string           | e.g. `"en-US"` (Google) or `"en"` (ElevenLabs).                                                |
+| `model`              | string           | STT model identifier.                                                                          |
+| `response_count`     | int              | Total backend responses received during the session.                                           |
+| `final_count`        | int              | Number of finals received.                                                                      |
+| `interim_count`      | int              | Number of interim/partial results received.                                                     |
+| `session_open_us`    | int              | Microseconds to open the backend session.                                                       |
+| `recv_us`            | int              | Backend receive latency in microseconds (ElevenLabs: commit → committed transcript).            |
+| `captured_at`        | RFC3339Nano      | When the sensor appended the reading (server-side).                                            |
 
 ## Binary record ↔ tabular row linking
 
@@ -165,7 +169,11 @@ Every uploaded WAV is tagged with:
 (Exact field names for the binary join may vary by Viam version — adjust
 `foreignField` if `_id` doesn't match.)
 
-## Example: wired with google-cloud-stt
+## Example: wired with an STT model
+
+Shown with `google-cloud-stt`; `elevenlabs-stt` wires up identically — set its
+`session_sensor_name` to the same sensor (swap the STT model and its
+credentials).
 
 ```json
 {

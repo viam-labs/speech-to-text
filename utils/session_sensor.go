@@ -1,4 +1,4 @@
-package speechtotext
+package utils
 
 import (
 	"context"
@@ -64,12 +64,17 @@ type SessionReading struct {
 	AudioSentBytes int
 	WAV            []byte // raw WAV bytes; uploaded to binary store, NOT stored in the tabular reading
 	StartTime      time.Time
-	EndTime        time.Time
+	EndTimeUs      int64 // session-close time, Unix microseconds
 	LanguageCode   string
 	Model          string
 	ResponseCount  int
 	FinalCount     int
 	InterimCount   int
+
+	// Timing metrics in microseconds. SessionOpenUs is filled by the shared
+	// listener for every provider; RecvUs comes from the provider session.
+	SessionOpenUs int64 // time to open the provider session
+	RecvUs        int64 // provider-defined receive latency
 }
 
 // SessionSensorSink is the in-process push API for STT models in this repo.
@@ -222,7 +227,7 @@ func (s *sessionSensor) PushSession(ctx context.Context, r SessionReading) (stri
 			"capture_" + r.CaptureID,
 			closeReasonTag(r.CloseReason),
 		}
-		times := [2]time.Time{r.StartTime, r.EndTime}
+		times := [2]time.Time{r.StartTime, time.UnixMicro(r.EndTimeUs)}
 		opts := &app.BinaryDataCaptureUploadOptions{
 			Tags:             tags,
 			DatasetIDs:       s.cfg.DatasetIDs,
@@ -248,13 +253,15 @@ func (s *sessionSensor) PushSession(ctx context.Context, r SessionReading) (stri
 		"error_message":    r.ErrorMessage,
 		"audio_sent_bytes": r.AudioSentBytes,
 		"start_time":       r.StartTime.UTC().Format(time.RFC3339Nano),
-		"end_time":         r.EndTime.UTC().Format(time.RFC3339Nano),
-		"duration_ms":      float64(r.EndTime.Sub(r.StartTime).Milliseconds()),
+		"end_time_us":      r.EndTimeUs,
+		"duration_ms":      float64(r.EndTimeUs-r.StartTime.UnixMicro()) / 1000,
 		"language_code":    r.LanguageCode,
 		"model":            r.Model,
 		"response_count":   r.ResponseCount,
 		"final_count":      r.FinalCount,
 		"interim_count":    r.InterimCount,
+		"session_open_us":  r.SessionOpenUs,
+		"recv_us":          r.RecvUs,
 		"captured_at":      time.Now().UTC().Format(time.RFC3339Nano),
 	}
 
@@ -322,10 +329,10 @@ func parsePushPayload(cmd map[string]interface{}) (SessionReading, error) {
 	} else {
 		return r, fmt.Errorf("start_time: %w", err)
 	}
-	if t, err := parseTimeField(cmd, "end_time"); err == nil {
-		r.EndTime = t
+	if n, ok := cmd["end_time_us"].(float64); ok {
+		r.EndTimeUs = int64(n)
 	} else {
-		return r, fmt.Errorf("end_time: %w", err)
+		return r, fmt.Errorf("end_time_us is required")
 	}
 	r.LanguageCode, _ = cmd["language_code"].(string)
 	r.Model, _ = cmd["model"].(string)
@@ -337,6 +344,12 @@ func parsePushPayload(cmd map[string]interface{}) (SessionReading, error) {
 	}
 	if n, ok := cmd["interim_count"].(float64); ok {
 		r.InterimCount = int(n)
+	}
+	if n, ok := cmd["session_open_us"].(float64); ok {
+		r.SessionOpenUs = int64(n)
+	}
+	if n, ok := cmd["recv_us"].(float64); ok {
+		r.RecvUs = int64(n)
 	}
 	return r, nil
 }

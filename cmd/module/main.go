@@ -1,7 +1,9 @@
 package main
 
 import (
-	"speechtotext"
+	"speechtotext/elevenlabs"
+	"speechtotext/google"
+	"speechtotext/utils"
 
 	generic "go.viam.com/rdk/components/generic"
 	"go.viam.com/rdk/components/sensor"
@@ -12,7 +14,8 @@ import (
 func main() {
 	// ModularMain can take multiple APIModel arguments, if your module implements multiple models.
 	module.ModularMain(
-		resource.APIModel{API: generic.API, Model: speechtotext.GoogleCloudSTT},
-		resource.APIModel{API: sensor.API, Model: speechtotext.SessionSensor},
+		resource.APIModel{API: generic.API, Model: google.Model},
+		resource.APIModel{API: generic.API, Model: elevenlabs.Model},
+		resource.APIModel{API: sensor.API, Model: utils.SessionSensor},
 	)
 }

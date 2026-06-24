@@ -63,7 +63,7 @@ The following attribute template can be used to configure this model:
 | `sample_rate_hertz`       | int     | Optional  | Sample rate of the input audio. Defaults to `16000`.                                                                                              |
 | `max_session_seconds`     | int     | Optional  | Caps a single Google streaming session. Google's hard cap is 305s; defaults to `290`.                                                             |
 | `speech_end_timeout_ms`   | int     | Optional  | Milliseconds of silence after which Google emits a final result and closes the stream (`VoiceActivityTimeout.speech_end_timeout`). When set, the transcript can arrive before the audio-segment sentinel fires, reducing end-to-end latency by the trailing-silence duration. Defaults to `0` (disabled). Only enable for audio that is known to be short, continuous utterances — a value shorter than any in-utterance pause will cause Google to fire early and produce partial or empty transcripts. `1500` is a reasonable starting point for single-sentence voice commands. |
-| `session_sensor_name`     | string  | Optional  | Resource name of a `viam:speech-to-text:session-sensor` to capture per-session audio + metadata to the Viam Data tab. If empty, capture is disabled. See [the session-sensor model docs](viam_speech-to-text_session-sensor.md). |
+| `session_sensor_name`     | string  | Optional  | Resource name of a `viam:speech-to-text:session-sensor` to capture per-session audio + metadata to the Viam Data tab. If empty, capture is disabled. See [the session-sensor model docs](../utils/viam_speech-to-text_session-sensor.md). |
 
 ### Example Configuration
 

@@ -1,4 +1,4 @@
-package speechtotext
+package utils
 
 import (
 	"context"
@@ -78,7 +78,7 @@ func sampleReading(captureID string) SessionReading {
 		AudioSentBytes: 1024,
 		WAV:            []byte{0x52, 0x49, 0x46, 0x46}, // fake WAV header bytes
 		StartTime:      now.Add(-time.Second),
-		EndTime:        now,
+		EndTimeUs:      now.UnixMicro(),
 		LanguageCode:   "en-US",
 		Model:          "latest_short",
 		ResponseCount:  3,
@@ -191,7 +191,7 @@ func TestDoCommandPushSessionRoundTrip(t *testing.T) {
 		"audio_sent_bytes": float64(2048),
 		"audio_wav_b64":    base64.StdEncoding.EncodeToString(wavBytes),
 		"start_time":       start.Format(time.RFC3339Nano),
-		"end_time":         end.Format(time.RFC3339Nano),
+		"end_time_us":      float64(end.UnixMicro()),
 		"language_code":    "en-US",
 	}
 

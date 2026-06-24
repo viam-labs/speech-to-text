@@ -3,18 +3,24 @@
   "module_id": "viam:speech-to-text",
   "visibility": "public",
   "url": "https://github.com/viam-labs/speech-to-text",
-  "description": "Speech-to-text components: google-cloud-stt + session-sensor capture",
+  "description": "Speech-to-text components: google-cloud-stt + elevenlabs-stt + session-sensor capture",
   "models": [
     {
       "api": "rdk:component:generic",
       "model": "viam:speech-to-text:google-cloud-stt",
-      "markdown_link": "viam_speech-to-text_google-cloud-stt.md#model-viamspeech-to-textgoogle-cloud-stt",
+      "markdown_link": "google/viam_speech-to-text_google-cloud-stt.md#model-viamspeech-to-textgoogle-cloud-stt",
       "short_description": "Streams audio from an audio_in source to Google Cloud STT and dispatches final transcripts."
+    },
+    {
+      "api": "rdk:component:generic",
+      "model": "viam:speech-to-text:elevenlabs-stt",
+      "markdown_link": "elevenlabs/viam_speech-to-text_elevenlabs-stt.md#model-viamspeech-to-textelevenlabs-stt",
+      "short_description": "Streams audio from an audio_in source to the ElevenLabs Scribe realtime WebSocket API and dispatches final transcripts."
     },
     {
       "api": "rdk:component:sensor",
       "model": "viam:speech-to-text:session-sensor",
-      "markdown_link": "viam_speech-to-text_session-sensor.md#model-viamspeech-to-textsession-sensor",
+      "markdown_link": "utils/viam_speech-to-text_session-sensor.md#model-viamspeech-to-textsession-sensor",
       "short_description": "Queues per-session capture records and uploads the corresponding WAV to Viam's binary store."
     }
   ],

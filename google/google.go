@@ -16,11 +16,8 @@ import (
 	speech "cloud.google.com/go/speech/apiv2"
 	speechpb "cloud.google.com/go/speech/apiv2/speechpb"
 	"google.golang.org/api/option"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/durationpb"
 
 	audioin "go.viam.com/rdk/components/audioin"
 	generic "go.viam.com/rdk/components/generic"
@@ -84,19 +81,6 @@ type Config struct {
 	// MaxSessionSeconds caps a single Google streaming session. Google's
 	// hard cap is 305s; defaults to 290s.
 	MaxSessionSeconds int `json:"max_session_seconds,omitempty"`
-
-	// SpeechEndTimeoutMs sets VoiceActivityTimeout.speech_end_timeout: after
-	// this many milliseconds of detected silence, Google emits a final result
-	// and closes the stream without waiting for an explicit CloseSend. This
-	// lets transcripts arrive before the audio-segment sentinel, cutting
-	// end-to-end latency by the amount of trailing silence in the clip.
-	//
-	// Defaults to 0 (disabled). Only enable this for audio that is known to
-	// be short, continuous utterances without internal pauses longer than this
-	// threshold — a value shorter than any in-utterance pause will cause Google
-	// to fire early, producing partial or empty transcripts. A value of 1500ms
-	// is a reasonable starting point for single-sentence voice commands.
-	SpeechEndTimeoutMs int `json:"speech_end_timeout_ms,omitempty"`
 
 	// SessionSensorName is the Viam resource name of a session-sensor
 	// component that captures per-session WAV + metadata for the Data tab.
@@ -204,15 +188,6 @@ func NewGoogleCloudSTT(ctx context.Context, deps resource.Dependencies, name res
 	if conf.Location != "global" {
 		clientOpts = append(clientOpts, option.WithEndpoint(fmt.Sprintf("%s-speech.googleapis.com:443", conf.Location)))
 	}
-	// Keep the underlying gRPC connection alive between streaming sessions so
-	// the first session after an idle period doesn't pay a full TLS handshake.
-	clientOpts = append(clientOpts, option.WithGRPCDialOption(
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                30 * time.Second,
-			Timeout:             5 * time.Second,
-			PermitWithoutStream: true,
-		}),
-	))
 	speechClient, err := speech.NewClient(ctx, clientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create google speech client: %w", err)
@@ -340,22 +315,6 @@ func (gt *googleTranscriber) Close() error {
 func (gt *googleTranscriber) configRequest() *speechpb.StreamingRecognizeRequest {
 	features := &speechpb.StreamingRecognitionFeatures{
 		InterimResults: false,
-	}
-	if gt.cfg.SpeechEndTimeoutMs > 0 {
-		// Let Google detect end-of-speech and close the stream autonomously.
-		// The final transcript arrives before the FakeMic sentinel fires,
-		// cutting post-audio latency by the trailing-silence duration.
-		//
-		// speech_start_timeout must be set explicitly alongside speech_end_timeout.
-		// When the VoiceActivityTimeout struct is provided but speech_start_timeout
-		// is absent (nil/zero in proto3), Google treats it as a zero-duration start
-		// timeout and immediately cancels any stream where speech isn't detected in
-		// the first few frames. Setting it to MaxSessionSeconds prevents that while
-		// still allowing speech_end_timeout to fire early once speech has ended.
-		features.VoiceActivityTimeout = &speechpb.StreamingRecognitionFeatures_VoiceActivityTimeout{
-			SpeechStartTimeout: durationpb.New(time.Duration(gt.cfg.MaxSessionSeconds) * time.Second),
-			SpeechEndTimeout:   durationpb.New(time.Duration(gt.cfg.SpeechEndTimeoutMs) * time.Millisecond),
-		}
 	}
 	return &speechpb.StreamingRecognizeRequest{
 		Recognizer: fmt.Sprintf("projects/%s/locations/%s/recognizers/_", gt.projectID, gt.cfg.Location),

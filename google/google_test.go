@@ -1,4 +1,4 @@
-package speechtotext
+package google
 
 import (
 	"context"
@@ -8,7 +8,6 @@ import (
 
 	speechpb "cloud.google.com/go/speech/apiv2/speechpb"
 	"go.viam.com/rdk/logging"
-	"go.viam.com/rdk/resource"
 )
 
 func alt(text string, conf float32) *speechpb.SpeechRecognitionAlternative {
@@ -55,17 +54,6 @@ func (f *fakeStream) Recv() (*speechpb.StreamingRecognizeResponse, error) {
 	return r, nil
 }
 
-// fakeTarget records deliverTranscript calls. Only DoCommand is called.
-type fakeTarget struct {
-	resource.Resource
-	delivered []string
-}
-
-func (f *fakeTarget) DoCommand(_ context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-	f.delivered = append(f.delivered, cmd["transcript"].(string))
-	return nil, nil
-}
-
 func finalResult(alts ...*speechpb.SpeechRecognitionAlternative) *speechpb.StreamingRecognizeResponse {
 	return &speechpb.StreamingRecognizeResponse{
 		Results: []*speechpb.StreamingRecognitionResult{{IsFinal: true, Alternatives: alts}},
@@ -105,26 +93,28 @@ func TestReceiveFromGoogleEmptyFinals(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			target := &fakeTarget{}
-			s := &googleCloudSTT{
-				logger:           logging.NewTestLogger(t),
-				cfg:              &Config{},
-				transcriptTarget: target,
+			var delivered []string
+			deliver := func(text string, _ float64) {
+				delivered = append(delivered, text)
+			}
+			gt := &googleTranscriber{
+				logger: logging.NewTestLogger(t),
+				cfg:    &Config{},
 			}
 			sess := &sessionState{}
 			done := make(chan struct{})
-			s.receiveFromGoogle(context.Background(), &fakeStream{resps: tc.resps}, sess, done)
+			gt.receiveFromGoogle(context.Background(), &fakeStream{resps: tc.resps}, sess, done, deliver)
 			<-done
 
 			if sess.finalCount != tc.wantFinals {
 				t.Errorf("finalCount = %d, want %d", sess.finalCount, tc.wantFinals)
 			}
-			if len(target.delivered) != len(tc.wantDelivered) {
-				t.Fatalf("delivered = %v, want %v", target.delivered, tc.wantDelivered)
+			if len(delivered) != len(tc.wantDelivered) {
+				t.Fatalf("delivered = %v, want %v", delivered, tc.wantDelivered)
 			}
 			for i := range tc.wantDelivered {
-				if target.delivered[i] != tc.wantDelivered[i] {
-					t.Errorf("delivered[%d] = %q, want %q", i, target.delivered[i], tc.wantDelivered[i])
+				if delivered[i] != tc.wantDelivered[i] {
+					t.Errorf("delivered[%d] = %q, want %q", i, delivered[i], tc.wantDelivered[i])
 				}
 			}
 			if got := normalizeCloseReason("segment-end sentinel", sess); got != tc.wantReason {
@@ -148,6 +138,12 @@ func TestNormalizeCloseReason(t *testing.T) {
 		{"recv error trumps finals", "segment-end sentinel", &sessionState{finalCount: 1, recvErr: errors.New("boom")}, "recv_error"},
 		{"audio_in closed", "audio_in channel closed", &sessionState{}, "context_cancelled"},
 		{"send error", "send error", &sessionState{}, "send_error"},
+		// VoiceActivityTimeout: Google closes the stream server-side after emitting
+		// a final, so drainAudio sees recvDone close and uses "recv died" as the
+		// reason. With no recv error and a usable final in hand, it's a success.
+		{"recv died with final (VAT success)", "recv died", &sessionState{finalCount: 1}, "success"},
+		{"recv died with no final", "recv died", &sessionState{}, "no_result"},
+		{"recv died with recv error", "recv died", &sessionState{finalCount: 1, recvErr: errors.New("boom")}, "recv_error"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := normalizeCloseReason(tc.reason, tc.sess); got != tc.want {

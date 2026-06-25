@@ -62,7 +62,7 @@ The following attribute template can be used to configure this model:
 | `location`                | string  | Optional  | Google Cloud region for the Speech v2 recognizer. Defaults to `global`. Regional models like `chirp_2` require a regional endpoint (e.g. `us-central1`). |
 | `sample_rate_hertz`       | int     | Optional  | Sample rate of the input audio. Defaults to `16000`.                                                                                              |
 | `max_session_seconds`     | int     | Optional  | Caps a single Google streaming session. Google's hard cap is 305s; defaults to `290`.                                                             |
-| `session_sensor_name`     | string  | Optional  | Resource name of a `viam:speech-to-text:session-sensor` to capture per-session audio + metadata to the Viam Data tab. If empty, capture is disabled. See [the session-sensor model docs](viam_speech-to-text_session-sensor.md). |
+| `session_sensor_name`     | string  | Optional  | Resource name of a `viam:speech-to-text:session-sensor` to capture per-session audio + metadata to the Viam Data tab. If empty, capture is disabled. See [the session-sensor model docs](../utils/viam_speech-to-text_session-sensor.md). |
 
 ### Example Configuration
 

@@ -161,7 +161,7 @@ func (l *Listener) drainAudio(ctx context.Context, audioChan <-chan *audioin.Aud
 
 		reading.CaptureID = captureID
 		reading.AudioSentBytes = audioSent
-		reading.StartTime = startedAt
+		reading.StartTimeUs = startedAt.UnixMicro()
 		reading.EndTimeUs = time.Now().UnixMicro()
 		wav, err := audioin.CreateWAVFile(audioBuf.Bytes(), l.SampleRate, 1, rutils.CodecPCM16)
 		if err != nil {

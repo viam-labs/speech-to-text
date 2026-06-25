@@ -68,7 +68,7 @@ Required fields:
   "command": "push_session",
   "capture_id": "<uuid>",
   "close_reason": "success",
-  "start_time": "<RFC3339Nano>",
+  "start_time_us": 1782156234029512,
   "end_time_us": 1782156234078695
 }
 ```
@@ -111,9 +111,9 @@ What lands in Viam cloud per session (the queued reading returned by
 | `close_reason`       | string           | `success`, `no_result`, `context_cancelled`; plus `send_error`/`recv_error`/`timeout` (Google) and `ws_error`/`timeout` (ElevenLabs). |
 | `error_message`      | string           | Underlying error for error close paths; empty otherwise.                                       |
 | `audio_sent_bytes`   | int              | Bytes forwarded to the STT backend during the session.                                         |
-| `start_time`         | RFC3339Nano      | Session-open timestamp. Also stamped on the binary record as `time_requested`.                 |
+| `start_time_us`      | int              | Session-open time, Unix microseconds. Also stamped on the binary record as `time_requested`.   |
 | `end_time_us`        | int              | Session-close time, Unix microseconds. Also stamped on the binary record as `time_received`.   |
-| `duration_ms`        | float            | `end_time_us - start_time` in ms (microsecond precision).                                       |
+| `duration_ms`        | float            | `end_time_us - start_time_us` in ms (microsecond precision).                                    |
 | `language_code`      | string           | e.g. `"en-US"` (Google) or `"en"` (ElevenLabs).                                                |
 | `model`              | string           | STT model identifier.                                                                          |
 | `response_count`     | int              | Total backend responses received during the session.                                           |

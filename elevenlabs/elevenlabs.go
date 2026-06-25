@@ -39,6 +39,7 @@ import (
 	"go.viam.com/rdk/resource"
 	genericservice "go.viam.com/rdk/services/generic"
 	"go.viam.com/rdk/spatialmath"
+	goutils "go.viam.com/utils"
 
 	"speechtotext/utils"
 )
@@ -151,7 +152,6 @@ func NewElevenLabsSTT(ctx context.Context, deps resource.Dependencies, name reso
 		sessionSink = sink
 	}
 
-	bgCtx, bgCancel := context.WithCancel(context.Background())
 	et := &elevenLabsTranscriber{
 		logger:       logger,
 		apiKey:       conf.APIKey,
@@ -159,8 +159,7 @@ func NewElevenLabsSTT(ctx context.Context, deps resource.Dependencies, name reso
 		languageCode: conf.LanguageCode,
 		sampleRate:   conf.SampleRateHertz,
 		httpClient:   &http.Client{Timeout: 10 * time.Second},
-		bgCtx:        bgCtx,
-		bgCancel:     bgCancel,
+		workers:      goutils.NewBackgroundStoppableWorkers(),
 	}
 
 	// Construction-level probe: fetch one single-use token so a bad api_key
@@ -172,7 +171,7 @@ func NewElevenLabsSTT(ctx context.Context, deps resource.Dependencies, name reso
 	cancel()
 	var authErr *elevenLabsAuthError
 	if errors.As(err, &authErr) {
-		bgCancel()
+		et.workers.Stop()
 		return nil, fmt.Errorf("elevenlabs api_key rejected: %w", err)
 	}
 	if err != nil {
@@ -252,10 +251,9 @@ type elevenLabsTranscriber struct {
 	sampleRate   int32
 	httpClient   *http.Client
 
-	// bgCtx scopes background prefetch goroutines to the module's lifetime, so
-	// they survive past any single request context but stop on Close.
-	bgCtx    context.Context
-	bgCancel context.CancelFunc
+	// workers runs background prefetch goroutines scoped to the module's
+	// lifetime: they survive any single request context but stop on Close.
+	workers *goutils.StoppableWorkers
 
 	mu         sync.Mutex
 	prefetchCh chan wsResult // non-nil while a pre-connect is in flight or ready
@@ -297,18 +295,20 @@ func (et *elevenLabsTranscriber) OpenSession(ctx context.Context, deliver utils.
 }
 
 func (et *elevenLabsTranscriber) Close() error {
-	et.bgCancel()
+	et.workers.Stop()
 	et.mu.Lock()
 	ch := et.prefetchCh
 	et.prefetchCh = nil
 	et.mu.Unlock()
 	if ch != nil {
-		// Drain and close the in-flight pre-connect so it isn't leaked.
-		go func() {
-			if res := <-ch; res.ws != nil {
+		// Close the pre-connected socket so it isn't leaked.
+		select {
+		case res := <-ch:
+			if res.ws != nil {
 				_ = res.ws.Close(websocket.StatusNormalClosure, "")
 			}
-		}()
+		default:
+		}
 	}
 	return nil
 }
@@ -325,10 +325,10 @@ func (et *elevenLabsTranscriber) schedulePrefetch() {
 	}
 	ch := make(chan wsResult, 1)
 	et.prefetchCh = ch
-	go func() {
-		ws, err := et.openWS(et.bgCtx)
+	et.workers.Add(func(ctx context.Context) {
+		ws, err := et.openWS(ctx)
 		ch <- wsResult{ws: ws, err: err}
-	}()
+	})
 }
 
 // acquireWS returns the pre-connected WebSocket if ready, otherwise opens a

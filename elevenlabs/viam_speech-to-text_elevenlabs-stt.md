@@ -13,6 +13,12 @@ This model shares the `audio_in` contract, transcript dispatch, and
 session-sensor capture with [`google-cloud-stt`](../google/viam_speech-to-text_google-cloud-stt.md);
 it differs only in the cloud backend and its config.
 
+> **Supported model: Scribe v2 realtime only.** This module is built entirely
+> around ElevenLabs' Scribe realtime streaming protocol (it streams audio chunks
+> over a WebSocket and commits at end of speech). The model is therefore fixed to
+> `scribe_v2_realtime` and is **not** configurable — ElevenLabs' non-streaming /
+> batch speech-to-text models use a different API the module does not implement.
+
 **Must be used with a `filter-mic` instance** — an `audio_in` source that gates
 audio on a wake word and emits a segment-end sentinel (an empty `AudioChunk`).
 
@@ -57,7 +63,6 @@ The following attribute template can be used to configure this model:
   "mic": "<audio_in component name>",
   "transcript_target": "<generic resource name>",
   "api_key": "<ElevenLabs API key>",
-  "model_id": "scribe_v2_realtime",
   "language_code": "en",
   "sample_rate_hertz": 16000,
   "session_sensor_name": "<session-sensor component name>"
@@ -71,7 +76,6 @@ The following attribute template can be used to configure this model:
 | `mic`                 | string | Required  | Resource name of an `audio_in` component that emits PCM16 mono audio (e.g. a `viam-wake-filter` instance).                                        |
 | `api_key`             | string | Required  | ElevenLabs API key. Validated at construction with a single token fetch — a rejected key (HTTP 401/403) fails the resource; transient errors are tolerated and retried at runtime. |
 | `transcript_target`   | string | Optional  | Resource name of a generic resource to receive `deliverTranscript` DoCommand calls. If empty, the module runs in log-only mode.                   |
-| `model_id`            | string | Optional  | ElevenLabs Scribe model. Defaults to `scribe_v2_realtime`.                                                                                        |
 | `language_code`       | string | Optional  | Recognition language. Defaults to `en`.                                                                                                           |
 | `sample_rate_hertz`   | int    | Optional  | Sample rate of the input audio. Defaults to `16000`.                                                                                              |
 | `session_sensor_name` | string | Optional  | Resource name of a `viam:speech-to-text:session-sensor` to capture per-session audio + metadata to the Viam Data tab. If empty, capture is disabled. See [the session-sensor model docs](../utils/viam_speech-to-text_session-sensor.md). |
@@ -113,4 +117,3 @@ Response:
   "language_code": "en"
 }
 ```
-</content>

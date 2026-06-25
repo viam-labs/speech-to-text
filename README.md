@@ -16,4 +16,3 @@ The two STT models share the same `audio_in` contract, transcript dispatch
 differ only in the cloud backend and its credentials/config, so a deployment can
 switch providers by swapping which model it instantiates and pointing both at
 the same session-sensor.
-</content>

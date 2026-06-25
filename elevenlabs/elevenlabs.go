@@ -50,9 +50,14 @@ var Model = resource.NewModel("viam", "speech-to-text", "elevenlabs-stt")
 var errUnimplemented = errors.New("unimplemented")
 
 const (
-	elevenLabsWSBase          = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
-	elevenLabsTokenURL        = "https://api.elevenlabs.io/v1/single-use-token/realtime_scribe"
-	defaultElevenLabsModel    = "scribe_v2_realtime"
+	elevenLabsWSBase   = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
+	elevenLabsTokenURL = "https://api.elevenlabs.io/v1/single-use-token/realtime_scribe"
+	// elevenLabsModelID is the only model this module supports. The module is
+	// built entirely around the Scribe v2 realtime streaming WebSocket protocol
+	// (chunked input_audio_chunk → commit → committed_transcript), so
+	// non-streaming / non-realtime models do not apply — the model is fixed
+	// rather than configurable.
+	elevenLabsModelID         = "scribe_v2_realtime"
 	defaultElevenLabsLanguage = "en"
 )
 
@@ -70,9 +75,6 @@ type elevenLabsConfig struct {
 
 	// APIKey is the ElevenLabs API key. Required.
 	APIKey string `json:"api_key"`
-
-	// ModelID picks the Scribe model. Defaults to "scribe_v2_realtime".
-	ModelID string `json:"model_id,omitempty"`
 }
 
 // Validate declares dependencies and validates required fields.
@@ -117,9 +119,6 @@ func newElevenLabsSTT(ctx context.Context, deps resource.Dependencies, rawConf r
 // NewElevenLabsSTT applies defaults, resolves dependencies, probes the API key,
 // and spawns the background listener.
 func NewElevenLabsSTT(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *elevenLabsConfig, logger logging.Logger) (resource.Resource, error) {
-	if conf.ModelID == "" {
-		conf.ModelID = defaultElevenLabsModel
-	}
 	if conf.LanguageCode == "" {
 		conf.LanguageCode = defaultElevenLabsLanguage
 	}
@@ -155,7 +154,6 @@ func NewElevenLabsSTT(ctx context.Context, deps resource.Dependencies, name reso
 	et := &elevenLabsTranscriber{
 		logger:       logger,
 		apiKey:       conf.APIKey,
-		modelID:      conf.ModelID,
 		languageCode: conf.LanguageCode,
 		sampleRate:   conf.SampleRateHertz,
 		httpClient:   &http.Client{Timeout: 10 * time.Second},
@@ -208,7 +206,7 @@ func NewElevenLabsSTT(ctx context.Context, deps resource.Dependencies, name reso
 		sinkMode = "→ " + conf.SessionSensorName
 	}
 	logger.Infof("speech-to-text-11labs ready: mic=%s lang=%s model=%s mode=%s session_sensor=%s",
-		conf.Mic, conf.LanguageCode, conf.ModelID, mode, sinkMode)
+		conf.Mic, conf.LanguageCode, elevenLabsModelID, mode, sinkMode)
 
 	return s, nil
 }
@@ -224,7 +222,7 @@ func (s *elevenLabsSTT) DoCommand(ctx context.Context, cmd map[string]interface{
 		return map[string]interface{}{
 			"transcript_target": s.cfg.TranscriptTarget,
 			"log_only":          s.listener.TranscriptTarget == nil,
-			"model_id":          s.cfg.ModelID,
+			"model_id":          elevenLabsModelID,
 			"language_code":     s.cfg.LanguageCode,
 		}, nil
 	default:
@@ -246,7 +244,6 @@ func (s *elevenLabsSTT) Close(_ context.Context) error {
 type elevenLabsTranscriber struct {
 	logger       logging.Logger
 	apiKey       string
-	modelID      string
 	languageCode string
 	sampleRate   int32
 	httpClient   *http.Client
@@ -384,7 +381,7 @@ func (et *elevenLabsTranscriber) openWS(ctx context.Context) (*websocket.Conn, e
 			et.logger.Warnf("prefetch attempt %d ws dial failed: %v", attempt+1, err)
 			continue
 		}
-		et.logger.Debugf("ws connected (attempt %d, model=%s lang=%s)", attempt+1, et.modelID, et.languageCode)
+		et.logger.Debugf("ws connected (attempt %d, model=%s lang=%s)", attempt+1, elevenLabsModelID, et.languageCode)
 		return ws, nil
 	}
 	return nil, lastErr
@@ -424,7 +421,7 @@ func (et *elevenLabsTranscriber) getSingleUseToken(ctx context.Context) (string,
 
 func (et *elevenLabsTranscriber) buildWSURL() string {
 	params := neturl.Values{}
-	params.Set("model_id", et.modelID)
+	params.Set("model_id", elevenLabsModelID)
 	params.Set("audio_format", fmt.Sprintf("pcm_%d", et.sampleRate))
 	params.Set("commit_strategy", "manual")
 	if et.languageCode != "" {
@@ -682,7 +679,7 @@ func (es *elevenLabsSession) Finish(ctx context.Context, reason string) (utils.S
 		Confidence:    0.0,
 		CloseReason:   closeReason,
 		LanguageCode:  es.et.languageCode,
-		Model:         es.et.modelID,
+		Model:         elevenLabsModelID,
 		ResponseCount: partialCount + finalCount,
 		FinalCount:    finalCount,
 		InterimCount:  partialCount,

@@ -65,29 +65,13 @@ func init() {
 
 // elevenLabsConfig holds the elevenlabs-stt model's machine.json attributes.
 type elevenLabsConfig struct {
-	// Mic is the Viam resource name of an audio_in component emitting PCM16
-	// mono audio (e.g. a viam-wake-filter instance).
-	Mic string `json:"mic"`
-
-	// TranscriptTarget is the Viam resource name of a generic component the
-	// module calls with each final transcript. Empty → log-only mode.
-	TranscriptTarget string `json:"transcript_target,omitempty"`
+	utils.STTConfig `json:",squash"`
 
 	// APIKey is the ElevenLabs API key. Required.
 	APIKey string `json:"api_key"`
 
 	// ModelID picks the Scribe model. Defaults to "scribe_v2_realtime".
 	ModelID string `json:"model_id,omitempty"`
-
-	// LanguageCode for recognition. Defaults to "en".
-	LanguageCode string `json:"language_code,omitempty"`
-
-	// SampleRateHertz of the input audio. Defaults to 16000.
-	SampleRateHertz int32 `json:"sample_rate_hertz,omitempty"`
-
-	// SessionSensorName is the Viam resource name of a session-sensor
-	// component capturing per-session WAV + metadata. Optional.
-	SessionSensorName string `json:"session_sensor_name,omitempty"`
 }
 
 // Validate declares dependencies and validates required fields.

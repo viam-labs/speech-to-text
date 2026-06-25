@@ -46,24 +46,10 @@ func init() {
 
 // Config holds the google-cloud-stt model's machine.json attributes.
 type Config struct {
-	// Mic is the Viam resource name of an audio_in component that emits
-	// PCM16 16kHz mono audio (e.g. a viam-wake-filter instance).
-	Mic string `json:"mic"`
-
-	// TranscriptTarget is the Viam resource name of a generic component
-	// the module calls when it has a final transcript. The target must
-	// expose a DoCommand handler accepting {"command": "deliverTranscript",
-	// "transcript": "...", "is_final": true, ...}.
-	//
-	// If empty, the module runs in log-only mode: finals are logged but not
-	// dispatched. Useful for local testing.
-	TranscriptTarget string `json:"transcript_target,omitempty"`
+	utils.STTConfig `json:",squash"`
 
 	// GoogleCredentialsJSON is the inline GCP service-account JSON. Required.
 	GoogleCredentialsJSON map[string]interface{} `json:"google_credentials_json"`
-
-	// LanguageCode for recognition. Defaults to "en-US".
-	LanguageCode string `json:"language_code,omitempty"`
 
 	// Model picks the recognition model. v2 supports "latest_short" (default,
 	// for commands), "latest_long", "chirp_2", etc.
@@ -75,17 +61,9 @@ type Config struct {
 	// When set to a non-global region, the client targets <location>-speech.googleapis.com.
 	Location string `json:"location,omitempty"`
 
-	// SampleRateHertz of the input audio. Defaults to 16000.
-	SampleRateHertz int32 `json:"sample_rate_hertz,omitempty"`
-
 	// MaxSessionSeconds caps a single Google streaming session. Google's
 	// hard cap is 305s; defaults to 290s.
 	MaxSessionSeconds int `json:"max_session_seconds,omitempty"`
-
-	// SessionSensorName is the Viam resource name of a session-sensor
-	// component that captures per-session WAV + metadata for the Data tab.
-	// Optional — if empty, capture is disabled and the module runs as before.
-	SessionSensorName string `json:"session_sensor_name,omitempty"`
 }
 
 // Validate declares dependencies and validates required fields.

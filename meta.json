@@ -15,7 +15,7 @@
       "api": "rdk:component:generic",
       "model": "viam:speech-to-text:elevenlabs-stt",
       "markdown_link": "elevenlabs/viam_speech-to-text_elevenlabs-stt.md#model-viamspeech-to-textelevenlabs-stt",
-      "short_description": "Streams audio from an audio_in source to the ElevenLabs Scribe realtime WebSocket API and dispatches final transcripts."
+      "short_description": "Streams audio from an audio_in source to ElevenLabs Scribe and dispatches final transcripts."
     },
     {
       "api": "rdk:component:sensor",

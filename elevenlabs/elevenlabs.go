@@ -528,7 +528,7 @@ func (es *elevenLabsSession) readLoop(ctx context.Context, ws *websocket.Conn, d
 			es.mu.Unlock()
 			if commitSent {
 				// Legitimate post-commit transcript.
-				es.et.logger.Infof("ws recv committed_transcript: %q", msg.Text)
+				es.et.logger.Debugf("ws recv committed_transcript: %q", msg.Text)
 				select {
 				case es.committedCh <- msg.Text:
 				default:
@@ -537,7 +537,7 @@ func (es *elevenLabsSession) readLoop(ctx context.Context, ws *websocket.Conn, d
 			}
 			// Server VAD fired before our manual commit; hold the text as a
 			// fallback but keep the reader alive for the post-commit transcript.
-			es.et.logger.Warnf("server auto-committed before manual commit (VAD); holding early text: %q", msg.Text)
+			es.et.logger.Debugf("server auto-committed before manual commit (VAD); holding early text: %q", msg.Text)
 			es.mu.Lock()
 			es.earlyCommittedText = msg.Text
 			es.mu.Unlock()
